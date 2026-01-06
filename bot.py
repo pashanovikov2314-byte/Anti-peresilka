@@ -237,7 +237,7 @@ class TelegramLeakBot:
             logger.info(f"📤 Уведомление отправлено о пользователе {user_id}")
         except Exception as e:
             logger.error(f"❌ Не удалось отправить уведомление: {e}")
-
+    
     def start_command(self, update: Update, context: CallbackContext):
         update.message.reply_text(
             "🛡️ LeakTracker Bot\n\n"
@@ -261,8 +261,7 @@ class TelegramLeakBot:
         help_text += "/clear - очистить данные (владелец)"
         
         update.message.reply_text(help_text)
-    
-    def leakstats_command(self, update: Update, context: CallbackContext):
+            def leakstats_command(self, update: Update, context: CallbackContext):
         if not self.leaks_by_user:
             update.message.reply_text("📭 Нарушителей не обнаружено")
             return
