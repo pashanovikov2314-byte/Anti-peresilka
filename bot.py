@@ -45,7 +45,7 @@ class TelegramLeakBot:
         self.self_ping_enabled = True
         self.is_running = True
         
-        self.updater = Updater(TOKEN, use_context=True)
+        self.updater = Updater(TOKEN)
         self.dp = self.updater.dispatcher
         
         self.register_handlers()
