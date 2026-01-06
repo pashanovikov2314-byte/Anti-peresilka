@@ -13,16 +13,16 @@ import os
 
 # ========== НАСТРОЙКИ ИЗ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ ==========
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
-YOUR_ID = int(os.environ.get("YOUR_TELEGRAM_ID"))
-RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL")
+YOUR_ID = int(os.environ.get("YOUR_TELEGRAM_ID", 0))
+RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL", "")
 PORT = int(os.environ.get("PORT", 5000))
 
 SELF_PING_INTERVAL = int(os.environ.get("SELF_PING_INTERVAL", 600))
 AUTO_SAVE_INTERVAL = int(os.environ.get("AUTO_SAVE_INTERVAL", 300))
 
-if not TOKEN:
-    raise ValueError("❌ TELEGRAM_TOKEN не установлен")
-if not YOUR_ID:
+if not TOKEN or TOKEN == "ВАШ_ТОКЕН":
+    raise ValueError("❌ TELEGRAM_TOKEN не установлен или неверный")
+if not YOUR_ID or YOUR_ID == 0:
     raise ValueError("❌ YOUR_TELEGRAM_ID не установлен")
 if not RENDER_URL:
     raise ValueError("❌ RENDER_EXTERNAL_URL не установлен")
@@ -237,7 +237,7 @@ class TelegramLeakBot:
             logger.info(f"📤 Уведомление отправлено о пользователе {user_id}")
         except Exception as e:
             logger.error(f"❌ Не удалось отправить уведомление: {e}")
-    
+
     def start_command(self, update: Update, context: CallbackContext):
         update.message.reply_text(
             "🛡️ LeakTracker Bot\n\n"
@@ -309,7 +309,7 @@ class TelegramLeakBot:
         table += f"\n🕒 Последнее обновление: {datetime.now().strftime('%H:%M:%S')}"
         
         update.message.reply_text(f"<pre>{table}</pre>", parse_mode='HTML')
-
+    
     def leakinfo_command(self, update: Update, context: CallbackContext):
         if not context.args:
             update.message.reply_text("ℹ️ Использование: /leakinfo [ID пользователя или @username]")
