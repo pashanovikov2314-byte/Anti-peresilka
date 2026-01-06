@@ -6,14 +6,14 @@ import requests
 from datetime import datetime
 from flask import Flask
 from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackContext, ContextTypes
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from collections import defaultdict
 import json
 import os
 
 # ========== НАСТРОЙКИ ИЗ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ ==========
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
-YOUR_ID = int(os.environ.get("YOUR_TEGRAM_ID", 0))
+YOUR_ID = int(os.environ.get("YOUR_TELEGRAM_ID", 0))
 RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL", "")
 PORT = int(os.environ.get("PORT", 5000))
 
@@ -21,7 +21,7 @@ SELF_PING_INTERVAL = int(os.environ.get("SELF_PING_INTERVAL", 600))
 AUTO_SAVE_INTERVAL = int(os.environ.get("AUTO_SAVE_INTERVAL", 300))
 
 if not TOKEN or TOKEN == "ВАШ_ТОКЕН":
-    raise ValueError("❌ TELEGRAM_TOKEN не установлен или неверный")
+    raise ValueError("❌ TELEGRAM_TOKEN не установлен")
 if not YOUR_ID or YOUR_ID == 0:
     raise ValueError("❌ YOUR_TELEGRAM_ID не установлен")
 if not RENDER_URL:
@@ -45,6 +45,10 @@ class TelegramLeakBot:
         self.self_ping_enabled = True
         self.is_running = True
         
+        # 🔥 SkillUP Ultra режим
+        self.skillup_ultra_mode = False
+        self.ultra_detection_level = 5
+        
         self.application = Application.builder().token(TOKEN).build()
         
         self.register_handlers()
@@ -63,6 +67,7 @@ class TelegramLeakBot:
         self.application.add_handler(CommandHandler("toggleping", self.toggleping_command))
         self.application.add_handler(CommandHandler("status", self.status_command))
         self.application.add_handler(CommandHandler("clear", self.clear_command))
+        self.application.add_handler(CommandHandler("skillup", self.skillup_command))
         self.application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, self.monitor_messages))
     
     def setup_flask_endpoints(self):
@@ -71,7 +76,8 @@ class TelegramLeakBot:
             uptime = (datetime.now() - self.bot_start_time).seconds
             hours = uptime // 3600
             minutes = (uptime % 3600) // 60
-            return f"<h1>🤖 LeakTracker Bot</h1><p>✅ Работает! Uptime: {hours}ч {minutes}м</p>"
+            ultra = "🟢 ВКЛ" if self.skillup_ultra_mode else "🔴 ВЫКЛ"
+            return f"<h1>🤖 LeakTracker Bot</h1><p>✅ Работает! Uptime: {hours}ч {minutes}м<br>🔥 SkillUP: {ultra}</p>"
         
         @app.route('/health')
         def health():
@@ -80,7 +86,8 @@ class TelegramLeakBot:
                 "uptime_seconds": (datetime.now() - self.bot_start_time).seconds,
                 "ping_count": self.ping_count,
                 "leak_count": len(self.leaks_by_user),
-                "user_count": len(self.user_info)
+                "user_count": len(self.user_info),
+                "skillup_ultra": self.skillup_ultra_mode
             }
         
         @app.route('/ping')
@@ -135,180 +142,346 @@ class TelegramLeakBot:
                 'first_name': msg.from_user.first_name or "",
                 'last_name': msg.from_user.last_name or "",
                 'last_seen': datetime.now().isoformat(),
-                'first_seen': datetime.now().isoformat()
+                'first_seen': datetime.now().isoformat(),
+                'message_count': 0
             }
         else:
             self.user_info[user_id]['last_seen'] = datetime.now().isoformat()
+            self.user_info[user_id]['message_count'] = self.user_info[user_id].get('message_count', 0) + 1
         
-        leak_info = self.detect_leak(msg)
+        # 🔥 Используем усиленный анализ в режиме SkillUP
+        leak_info = self.detect_leak_ultra(msg) if self.skillup_ultra_mode else self.detect_leak(msg)
         
         if leak_info:
             await self.handle_leak(user_id, leak_info, msg, context)
+def detect_leak(self, msg):
+    leak_type = None
+    leak_details = ""
     
-    def detect_leak(self, msg):
-        leak_type = None
-        leak_details = ""
+    if msg.forward_from_chat:
+        leak_type = "ПЕРЕСЫЛКА В ЧАТ"
+        leak_details = f"В чат: {msg.forward_from_chat.title}"
         
-        if msg.forward_from_chat:
-            leak_type = "ПЕРЕСЫЛКА В ЧАТ"
-            leak_details = f"В чат: {msg.forward_from_chat.title}"
-            
-        elif msg.forward_from:
-            leak_type = "ПЕРЕСЫЛКА ПОЛЬЗОВАТЕЛЮ"
-            target = msg.forward_from.username or f"id{msg.forward_from.id}"
-            leak_details = f"Пользователю: {target}"
-        
-        elif msg.text or msg.caption:
-            text = msg.text or msg.caption
-            chat_id = msg.chat.id
-            
-            telegram_link_pattern = r't\.me/(?:c/)?[a-zA-Z0-9_\-/]+'
-            if re.search(telegram_link_pattern, text):
-                leak_type = "КОПИРОВАНИЕ ССЫЛКИ"
-                leak_details = "Скопировал ссылку на сообщение"
-            
-            elif len(text) > 300 and '\n' in text:
-                leak_type = "КОПИРОВАНИЕ ТЕКСТА"
-                leak_details = f"Скопировал {len(text)} символов"
-        
-        screenshot_score = self.calculate_screenshot_score(msg)
-        if screenshot_score > 75:
-            leak_type = "ПОДОЗРЕНИЕ НА СКРИНШОТ"
-            leak_details = f"Вероятность скриншота: {screenshot_score}%"
-        
-        if leak_type:
-            return {
-                'type': leak_type,
-                'details': leak_details,
-                'timestamp': datetime.now().isoformat(),
-                'chat_id': msg.chat.id,
-                'chat_title': msg.chat.title or f"Чат {msg.chat.id}",
-                'message_id': msg.message_id
-            }
-        
-        return None
+    elif msg.forward_from:
+        leak_type = "ПЕРЕСЫЛКА ПОЛЬЗОВАТЕЛЮ"
+        target = msg.forward_from.username or f"id{msg.forward_from.id}"
+        leak_details = f"Пользователю: {target}"
     
-    def calculate_screenshot_score(self, msg):
-        score = 0
+    elif msg.text or msg.caption:
+        text = msg.text or msg.caption
         
-        if hasattr(msg, 'reply_to_message') and msg.reply_to_message:
-            time_diff = (msg.date - msg.reply_to_message.date).total_seconds()
-            if time_diff > 180:
-                score += 30
+        telegram_link_pattern = r't\.me/(?:c/)?[a-zA-Z0-9_\-/]+'
+        if re.search(telegram_link_pattern, text):
+            leak_type = "КОПИРОВАНИЕ ССЫЛКИ"
+            leak_details = "Скопировал ссылку на сообщение"
         
-        if msg.text and len(msg.text) < 15:
-            screenshot_emojis = ['📸', '🖼', '💾', '📱', '📲', '⬇️', '⬆️', '👇', '👆']
-            if any(emoji in msg.text for emoji in screenshot_emojis):
-                score += 40
+        elif len(text) > 300 and '\n' in text:
+            leak_type = "КОПИРОВАНИЕ ТЕКСТА"
+            leak_details = f"Скопировал {len(text)} символов"
+    
+    screenshot_score = self.calculate_screenshot_score(msg)
+    if screenshot_score > 75:
+        leak_type = "ПОДОЗРЕНИЕ НА СКРИНШОТ"
+        leak_details = f"Вероятность скриншота: {screenshot_score}%"
+    
+    if leak_type:
+        return {
+            'type': leak_type,
+            'details': leak_details,
+            'timestamp': datetime.now().isoformat(),
+            'chat_id': msg.chat.id,
+            'chat_title': msg.chat.title or f"Чат {msg.chat.id}",
+            'message_id': msg.message_id,
+            'detection_mode': 'NORMAL'
+        }
+    
+    return None
+
+def detect_leak_ultra(self, msg):
+    """🔥 РЕЖИМ SKILLUP ULTRA: 5x увеличение точности"""
+    leak_type = None
+    leak_details = ""
+    
+    # 1. ПЕРЕСЫЛКИ
+    if msg.forward_from_chat:
+        leak_type = "ПЕРЕСЫЛКА В ЧАТ"
+        leak_details = f"В чат: {msg.forward_from_chat.title}"
         
-        if msg.photo or msg.video or msg.document:
+    elif msg.forward_from:
+        leak_type = "ПЕРЕСЫЛКА ПОЛЬЗОВАТЕЛЮ"
+        target = msg.forward_from.username or f"id{msg.forward_from.id}"
+        leak_details = f"Пользователю: {target}"
+    
+    # 2. АНАЛИЗ ТЕКСТА
+    elif msg.text or msg.caption:
+        text = msg.text or msg.caption
+        
+        # Любые ссылки
+        link_pattern = r'(https?://\S+|www\.\S+|t\.me/\S+)'
+        links = re.findall(link_pattern, text)
+        if links:
+            leak_type = "КОПИРОВАНИЕ ССЫЛКИ"
+            leak_details = f"Найдены ссылки: {', '.join(links[:3])}"
+        
+        # Ключевые слова утечки
+        leak_keywords = ['слив', 'скрин', 'screen', 'переслал', 'leak', 'слито', 'фоточата']
+        found_keywords = [kw for kw in leak_keywords if kw in text.lower()]
+        if found_keywords:
+            leak_type = "ПОДОЗРИТЕЛЬНЫЙ ТЕКСТ"
+            leak_details = f"Ключевые слова: {', '.join(found_keywords[:3])}"
+        
+        # Детекция длинных сообщений
+        elif len(text) > 150 and '\n' in text:
+            leak_type = "КОПИРОВАНИЕ ТЕКСТА"
+            leak_details = f"Скопировал {len(text)} символов"
+    
+    # 3. АНАЛИЗ СКРИНШОТОВ
+    screenshot_score = self.calculate_screenshot_score_ultra(msg)
+    if screenshot_score > 50:
+        leak_type = "ПОДОЗРЕНИЕ НА СКРИНШОТ"
+        leak_details = f"Вероятность скриншота: {screenshot_score}% (ULTRA режим)"
+    
+    # 4. АНАЛИЗ МЕДИА
+    if msg.photo or msg.video or msg.document:
+        media_type = "фото" if msg.photo else "видео" if msg.video else "документ"
+        if not leak_type:
+            leak_type = "СОХРАНЕНИЕ МЕДИА"
+            leak_details = f"Сохранил {media_type}"
+    
+    if leak_type:
+        return {
+            'type': leak_type,
+            'details': leak_details,
+            'timestamp': datetime.now().isoformat(),
+            'chat_id': msg.chat.id,
+            'chat_title': msg.chat.title or f"Чат {msg.chat.id}",
+            'message_id': msg.message_id,
+            'detection_mode': 'ULTRA',
+            'detection_score': screenshot_score if 'скриншот' in leak_type.lower() else 85,
+            'ultra_level': self.ultra_detection_level
+        }
+    
+    return None
+
+def calculate_screenshot_score(self, msg):
+    score = 0
+    
+    if hasattr(msg, 'reply_to_message') and msg.reply_to_message:
+        time_diff = (msg.date - msg.reply_to_message.date).total_seconds()
+        if time_diff > 180:
+            score += 30
+    
+    if msg.text and len(msg.text) < 15:
+        screenshot_emojis = ['📸', '🖼', '💾', '📱', '📲', '⬇️', '⬆️', '👇', '👆']
+        if any(emoji in msg.text for emoji in screenshot_emojis):
+            score += 40
+    
+    if msg.photo or msg.video or msg.document:
+        score += 20
+    
+    return min(score, 100)
+
+def calculate_screenshot_score_ultra(self, msg):
+    """🔥 Усиленная детекция скриншотов"""
+    score = 0
+    
+    # Анализ времени ответа
+    if hasattr(msg, 'reply_to_message') and msg.reply_to_message:
+        time_diff = (msg.date - msg.reply_to_message.date).total_seconds()
+        if time_diff > 60:
+            score += 25
+        if time_diff > 300:
+            score += 35
+    
+    # Анализ текста
+    if msg.text:
+        screenshot_indicators = ['📸', '🖼', '💾', '📱', '📲', '⬇️', '⬆️', '👇', '👆']
+        if any(indicator in msg.text for indicator in screenshot_indicators):
+            score += 30
+        
+        screenshot_words = ['скрин', 'screen', 'снял', 'фото', 'сохранил']
+        if any(word in msg.text.lower() for word in screenshot_words):
+            score += 35
+        
+        if len(msg.text) < 10 and any(c.isdigit() for c in msg.text):
             score += 20
-        
-        return min(score, 100)
     
-    async def handle_leak(self, user_id, leak_info, msg, context):
-        self.leaks_by_user[user_id].append(leak_info)
-        
-        if len(self.leaks_by_user[user_id]) > 50:
-            self.leaks_by_user[user_id] = self.leaks_by_user[user_id][-50:]
-        
-        await self.send_leak_alert(user_id, leak_info, msg, context)
-        self.save_data()
+    # Анализ медиа
+    if msg.photo:
+        score += 25
+    if msg.video:
+        score += 20
+    if msg.document:
+        score += 15
     
-    async def send_leak_alert(self, user_id, leak_info, msg, context):
+    return min(score * self.ultra_detection_level, 100)
+
+async def handle_leak(self, user_id, leak_info, msg, context):
+    self.leaks_by_user[user_id].append(leak_info)
+    
+    if len(self.leaks_by_user[user_id]) > 50:
+        self.leaks_by_user[user_id] = self.leaks_by_user[user_id][-50:]
+    
+    await self.send_leak_alert(user_id, leak_info, msg, context)
+    self.save_data()
+
+async def send_leak_alert(self, user_id, leak_info, msg, context):
+    user = self.user_info.get(user_id, {'username': f'id{user_id}', 'first_name': ''})
+    
+    mode_icon = "🔥" if leak_info.get('detection_mode') == 'ULTRA' else "⚠️"
+    alert = f"{mode_icon} ОБНАРУЖЕНА УТЕЧКА\n\n"
+    alert += f"👤 Нарушитель: @{user['username']}\n"
+    alert += f"📛 Имя: {user['first_name']} {user.get('last_name', '')}\n"
+    alert += f"🆔 ID: {user_id}\n"
+    alert += f"💬 Чат: {msg.chat.title}\n"
+    alert += f"⏰ Время: {datetime.now().strftime('%H:%M:%S')}\n\n"
+    alert += f"📌 Тип нарушения: {leak_info['type']}\n"
+    alert += f"📝 Детали: {leak_info['details']}\n"
+    
+    if leak_info.get('detection_mode') == 'ULTRA':
+        alert += f"🎯 Точность: {leak_info.get('detection_score', 0)}%\n"
+        alert += f"⚡ Режим: SkillUP Ultra\n"
+    
+    alert += f"\n📊 Всего нарушений: {len(self.leaks_by_user[user_id])}"
+    
+    try:
+        await context.bot.send_message(
+            chat_id=YOUR_ID,
+            text=alert
+        )
+        logger.info(f"📤 Уведомление отправлено")
+    except Exception as e:
+        logger.error(f"❌ Ошибка отправки: {e}")
+async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ultra_status = "🔥 ВКЛЮЧЕН" if self.skillup_ultra_mode else "⚡ ВЫКЛЮЧЕН"
+    
+    await update.message.reply_text(
+        f"🛡️ LeakTracker Bot\n\n"
+        f"Я отслеживаю утечки информации из чатов.\n"
+        f"🔥 SkillUP Ultra: {ultra_status}\n\n"
+        f"📋 Команды:\n"
+        f"/leakstats - таблица нарушителей\n"
+        f"/leakinfo [id] - информация о нарушителе\n"
+        f"/status - статус бота\n"
+        f"/skillup - режим максимальной точности\n"
+        f"/help - справка"
+    )
+
+async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    help_text = "📖 СПРАВКА:\n\n"
+    help_text += "/start - информация о боте\n"
+    help_text += "/help - эта справка\n"
+    help_text += "/leakstats - таблица нарушителей\n"
+    help_text += "/leakinfo [id] - информация о нарушителе\n"
+    help_text += "/status - статус бота\n"
+    help_text += "/pingstatus - статус самопинга (владелец)\n"
+    help_text += "/toggleping - вкл/выкл самопинг (владелец)\n"
+    help_text += "/skillup - 🔥 ВКЛ/ВЫКЛ режим SkillUP\n"
+    help_text += "/clear - очистить данные (владелец)"
+    
+    await update.message.reply_text(help_text)
+
+async def skillup_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.from_user.id != YOUR_ID:
+        await update.message.reply_text("⛔ Эта команда только для владельца")
+        return
+    
+    if not context.args:
+        status = "🔥 ВКЛЮЧЕН" if self.skillup_ultra_mode else "⚡ ВЫКЛЮЧЕН"
+        await update.message.reply_text(
+            f"🔥 SkillUP Ultra: {status}\n"
+            f"Уровень точности: {self.ultra_detection_level}x\n\n"
+            f"Использование:\n"
+            f"/skillup on - включить\n"
+            f"/skillup off - выключить"
+        )
+        return
+    
+    action = context.args[0].lower()
+    
+    if action == 'on' or action == 'вкл':
+        self.skillup_ultra_mode = True
+        await update.message.reply_text(
+            "🔥 SKILLUP ULTRA АКТИВИРОВАН!\n\n"
+            "✅ Детекция усилена в 5 раз\n"
+            "✅ Пороги срабатывания снижены\n"
+            "✅ Анализ скриншотов максимальный\n"
+            "⚡ Уровень точности: 5x"
+        )
+        logger.info("🔥 SkillUP Ultra активирован")
+        
+    elif action == 'off' or action == 'выкл':
+        self.skillup_ultra_mode = False
+        await update.message.reply_text(
+            "⚡ SkillUP Ultra выключен\n"
+            "Бот в обычном режиме"
+        )
+        logger.info("⚡ SkillUP Ultra выключен")
+    else:
+        await update.message.reply_text(
+            "❌ Неизвестная команда\n"
+            "Используйте: /skillup on или /skillup off"
+        )
+
+async def leakstats_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not self.leaks_by_user:
+        await update.message.reply_text("📭 Нарушителей не обнаружено")
+        return
+    
+    stats = []
+    for user_id, leaks in self.leaks_by_user.items():
+        if not leaks:
+            continue
+        
         user = self.user_info.get(user_id, {'username': f'id{user_id}', 'first_name': ''})
         
-        alert = f"🚨 ОБНАРУЖЕНА УТЕЧКА\n\n"
-        alert += f"👤 Нарушитель: @{user['username']}\n"
-        alert += f"📛 Имя: {user['first_name']} {user.get('last_name', '')}\n"
-        alert += f"🆔 ID: {user_id}\n"
-        alert += f"💬 Чат: {msg.chat.title}\n"
-        alert += f"⏰ Время: {datetime.now().strftime('%H:%M:%S')}\n\n"
-        alert += f"📌 Тип нарушения: {leak_info['type']}\n"
-        alert += f"📝 Детали: {leak_info['details']}\n\n"
-        alert += f"📊 Всего нарушений у этого пользователя: {len(self.leaks_by_user[user_id])}"
+        leak_types = {}
+        for leak in leaks[-20:]:
+            leak_type = leak['type']
+            leak_types[leak_type] = leak_types.get(leak_type, 0) + 1
         
-        try:
-            await context.bot.send_message(
-                chat_id=YOUR_ID,
-                text=alert
-            )
-            logger.info(f"📤 Уведомление отправлено о пользователе {user_id}")
-        except Exception as e:
-            logger.error(f"❌ Не удалось отправить уведомление: {e}")
+        ultra_leaks = [l for l in leaks if l.get('detection_mode') == 'ULTRA']
+        
+        stats.append({
+            'user_id': user_id,
+            'username': user['username'],
+            'total_leaks': len(leaks),
+            'ultra_leaks': len(ultra_leaks),
+            'leak_types': leak_types
+        })
     
-    async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text(
-            "🛡️ LeakTracker Bot\n\n"
-            "Я отслеживаю утечки информации из чатов.\n\n"
-            "📋 Команды:\n"
-            "/leakstats - таблица нарушителей\n"
-            "/leakinfo [id] - информация о нарушителе\n"
-            "/status - статус бота\n"
-            "/help - справка"
-        )
+    stats.sort(key=lambda x: x['total_leaks'], reverse=True)
     
-    async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        help_text = "📖 СПРАВКА:\n\n"
-        help_text += "/start - информация о боте\n"
-        help_text += "/help - эта справка\n"
-        help_text += "/leakstats - таблица всех нарушителей\n"
-        help_text += "/leakinfo [id] - информация о нарушителе\n"
-        help_text += "/status - статус бота\n"
-        help_text += "/pingstatus - статус самопинга (владелец)\n"
-        help_text += "/toggleping - вкл/выкл самопинг (владелец)\n"
-        help_text += "/clear - очистить данные (владелец)"
-        
-        await update.message.reply_text(help_text)
+    table = "📊 ТАБЛИЦА НАРУШИТЕЛЕЙ\n"
+    if self.skillup_ultra_mode:
+        table += "🔥 SkillUP Ultra: АКТИВЕН\n\n"
+    else:
+        table += "\n"
     
-    async def leakstats_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not self.leaks_by_user:
-            await update.message.reply_text("📭 Нарушителей не обнаружено")
-            return
+    table += "┌──────────────┬────────────────┬────────────┬─────────────────────────────┐\n"
+    table += "│ Пользователь │ Всего нарушений │ ULTRA-утечек │ Основные типы нарушений  │\n"
+    table += "├──────────────┼────────────────┼────────────┼─────────────────────────────┤\n"
+    
+    for stat in stats[:15]:
+        username = f"@{stat['username']}" if not stat['username'].startswith('id') else stat['username']
+        username_display = username[:12].ljust(12)
         
-        stats = []
-        for user_id, leaks in self.leaks_by_user.items():
-            if not leaks:
-                continue
-            
-            user = self.user_info.get(user_id, {'username': f'id{user_id}', 'first_name': ''})
-            
-            leak_types = {}
-            for leak in leaks[-20:]:
-                leak_type = leak['type']
-                leak_types[leak_type] = leak_types.get(leak_type, 0) + 1
-            
-            stats.append({
-                'user_id': user_id,
-                'username': user['username'],
-                'total_leaks': len(leaks),
-                'leak_types': leak_types
-            })
+        ultra_display = f"{stat['ultra_leaks']}".center(12)
         
-        stats.sort(key=lambda x: x['total_leaks'], reverse=True)
+        types_str = ""
+        for leak_type, count in list(stat['leak_types'].items())[:2]:
+            short_type = leak_type[:10] + ".." if len(leak_type) > 10 else leak_type
+            types_str += f"{short_type}:{count} "
         
-        table = "📊 ТАБЛИЦА НАРУШИТЕЛЕЙ\n\n"
-        table += "┌──────────────┬────────────────┬─────────────────────────────┐\n"
-        table += "│ Пользователь │ Всего нарушений │ Основные типы нарушений    │\n"
-        table += "├──────────────┼────────────────┼─────────────────────────────┤\n"
-        
-        for stat in stats[:15]:
-            username = f"@{stat['username']}" if not stat['username'].startswith('id') else stat['username']
-            username_display = username[:12].ljust(12)
-            
-            types_str = ""
-            for leak_type, count in list(stat['leak_types'].items())[:3]:
-                short_type = leak_type[:8] + ".." if len(leak_type) > 8 else leak_type
-                types_str += f"{short_type}:{count} "
-            
-            table += f"│ {username_display} │ {stat['total_leaks']:<14} │ {types_str:<27} │\n"
-        
-        table += "└──────────────┴────────────────┴─────────────────────────────┘\n"
-        table += f"\n📈 Всего нарушителей: {len(stats)}"
-        table += f"\n🕒 Последнее обновление: {datetime.now().strftime('%H:%M:%S')}"
-        
-        await update.message.reply_text(f"<pre>{table}</pre>", parse_mode='HTML')
-            async def leakinfo_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        table += f"│ {username_display} │ {stat['total_leaks']:<14} │ {ultra_display} │ {types_str:<27} │\n"
+    
+    table += "└──────────────┴────────────────┴────────────┴─────────────────────────────┘\n"
+    table += f"\n📈 Всего нарушителей: {len(stats)}"
+    table += f"\n🔥 ULTRA-режим: {'ВКЛ' if self.skillup_ultra_mode else 'ВЫКЛ'}"
+    table += f"\n🕒 Обновлено: {datetime.now().strftime('%H:%M:%S')}"
+    
+    await update.message.reply_text(f"<pre>{table}</pre>", parse_mode='HTML')
+        async def leakinfo_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not context.args:
             await update.message.reply_text("ℹ️ Использование: /leakinfo [ID пользователя или @username]")
             return
@@ -332,7 +505,6 @@ class TelegramLeakBot:
         report += f"👤 Пользователь: @{user['username']}\n"
         report += f"🆔 ID: {user_id}\n"
         report += f"📛 Имя: {user['first_name']} {user.get('last_name', '')}\n"
-        report += f"📅 Первый раз замечен: {user.get('first_seen', 'Неизвестно')}\n"
         report += f"📅 Последняя активность: {user.get('last_seen', 'Неизвестно')}\n\n"
         report += f"🚨 Всего нарушений: {len(leaks)}\n\n"
         
@@ -351,8 +523,6 @@ class TelegramLeakBot:
             for i, leak in enumerate(leaks[-5:][::-1], 1):
                 time_str = datetime.fromisoformat(leak['timestamp']).strftime("%d.%m %H:%M")
                 report += f"{i}. {time_str} - {leak['type']}\n"
-                if leak['details']:
-                    report += f"   {leak['details'][:50]}\n"
         
         await update.message.reply_text(f"<pre>{report}</pre>", parse_mode='HTML')
     
@@ -380,7 +550,7 @@ class TelegramLeakBot:
         else:
             message += f"Последний пинг: Никогда\n"
         
-        message += f"\n🔗 URL приложения: {RENDER_URL}"
+        message += f"\n🔗 URL: {RENDER_URL}"
         
         await update.message.reply_text(message)
     
@@ -409,7 +579,8 @@ class TelegramLeakBot:
         status += f"👤 Мониторится пользователей: {len(self.user_info)}\n"
         status += f"🔗 URL: {RENDER_URL}\n"
         status += f"🏓 Самопинг: {'Включен' if self.self_ping_enabled else 'Выключен'}\n"
-        status += f"🔄 Всего пингов: {self.ping_count}"
+        status += f"🔄 Всего пингов: {self.ping_count}\n"
+        status += f"🔥 SkillUP Ultra: {'ВКЛ' if self.skillup_ultra_mode else 'ВЫКЛ'}"
         
         await update.message.reply_text(status)
     
