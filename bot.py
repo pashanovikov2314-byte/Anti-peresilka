@@ -11,152 +11,168 @@ from collections import defaultdict
 import json
 import os
 
-# ========== КОНФИГУРАЦИЯ ==========
-TOKEN = os.environ.get("TELEGRAM_TOKEN", "ВАШ_ТОКЕН")
-YOUR_ID = int(os.environ.get("YOUR_TELEGRAM_ID", "123456789"))
-RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL", "https://ваш-бот.onrender.com")
-PORT = int(os.environ.get("PORT", 5000))
-# ==================================
+# ========== НАСТРОЙКИ ИЗ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ ==========
+# Все эти переменные нужно установить в настройках Render
+TOKEN = os.environ.get("TELEGRAM_TOKEN")  # Токен бота от @BotFather
+YOUR_ID = int(os.environ.get("YOUR_TELEGRAM_ID"))  # Ваш ID Telegram
+RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL")  # URL вашего приложения на Render
+PORT = int(os.environ.get("PORT", 5000))  # Порт для Flask
 
-# Flask приложение для Render
+# Дополнительные настройки (необязательные)
+SELF_PING_INTERVAL = int(os.environ.get("SELF_PING_INTERVAL", 600))  # Интервал пинга в секундах (по умолчанию 10 мин)
+AUTO_SAVE_INTERVAL = int(os.environ.get("AUTO_SAVE_INTERVAL", 300))  # Интервал автосохранения в секундах
+# =======================================================
+
+# Проверка обязательных переменных
+if not TOKEN:
+    raise ValueError("❌ TELEGRAM_TOKEN не установлен в переменных окружения")
+if not YOUR_ID:
+    raise ValueError("❌ YOUR_TELEGRAM_ID не установлен в переменных окружения")
+if not RENDER_URL:
+    raise ValueError("❌ RENDER_EXTERNAL_URL не установлен в переменных окружения")
+
+# Flask приложение
 app = Flask(__name__)
 
+# Настройка логирования
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-class SelfPingBot:
+class TelegramLeakBot:
     def __init__(self):
+        # Время старта для отсчета аптайма
         self.bot_start_time = datetime.now()
-        self.leaks_by_user = defaultdict(list)
-        self.user_info = {}
         
-        # Статистика самопинга
+        # Структуры данных для хранения информации
+        self.leaks_by_user = defaultdict(list)  # ID пользователя -> список нарушений
+        self.user_info = {}  # ID пользователя -> информация о пользователе
+        
+        # Настройки самопинга
         self.ping_count = 0
         self.last_successful_ping = None
         self.self_ping_enabled = True
+        self.is_running = True
         
-        # Инициализируем бота
+        # Инициализация Telegram бота
         self.updater = Updater(TOKEN, use_context=True)
         self.dp = self.updater.dispatcher
         
-        # Регистрация обработчиков
+        # Регистрация обработчиков команд
         self.register_handlers()
         
-        # Загрузка данных
+        # Загрузка сохраненных данных
         self.load_data()
         
         # Запуск фоновых задач
         self.start_background_tasks()
         
-        logger.info("🤖 Бот инициализирован с самопингом")
+        # Настройка Flask эндпоинтов
+        self.setup_flask_endpoints()
+        
+        logger.info(f"🤖 Бот инициализирован для работы на Render")
+        logger.info(f"🔗 URL: {RENDER_URL}")
+        logger.info(f"👤 Ваш ID: {YOUR_ID}")
     
     def register_handlers(self):
         """Регистрация команд бота"""
-        self.dp.add_handler(CommandHandler("start", self.start_cmd))
-        self.dp.add_handler(CommandHandler("leakstats", self.leakstats_cmd))
-        self.dp.add_handler(CommandHandler("pingstatus", self.pingstatus_cmd))
-        self.dp.add_handler(CommandHandler("toggleping", self.toggleping_cmd))
+        self.dp.add_handler(CommandHandler("start", self.start_command))
+        self.dp.add_handler(CommandHandler("help", self.help_command))
+        self.dp.add_handler(CommandHandler("leakstats", self.leakstats_command))
+        self.dp.add_handler(CommandHandler("leakinfo", self.leakinfo_command))
+        self.dp.add_handler(CommandHandler("pingstatus", self.pingstatus_command))
+        self.dp.add_handler(CommandHandler("toggleping", self.toggleping_command))
+        self.dp.add_handler(CommandHandler("status", self.status_command))
+        self.dp.add_handler(CommandHandler("clear", self.clear_command))
         self.dp.add_handler(MessageHandler(Filters.all & ~Filters.command, self.monitor_messages))
     
-    def start_background_tasks(self):
-        """Запуск фоновых задач для самопинга и автосохранения"""
-        # Задача самопинга каждые 10 минут
-        def self_ping_task():
-            while True:
-                if self.self_ping_enabled:
-                    self.perform_self_ping()
-                time.sleep(600)  # 10 минут
-        
-        # Автосохранение данных каждые 5 минут
-        def auto_save_task():
-            while True:
-                time.sleep(300)  # 5 минут
-                self.save_data()
-                logger.info("💾 Данные автосохранены")
-        
-        # Запускаем в отдельных потоках
-        threading.Thread(target=self_ping_task, daemon=True).start()
-        threading.Thread(target=auto_save_task, daemon=True).start()
-        
-        # Также создаем Flask эндпоинты для проверки
+    def setup_flask_endpoints(self):
+        """Настройка Flask эндпоинтов"""
         @app.route('/')
         def home():
-            return f"✅ Бот работает! Uptime: {(datetime.now() - self.bot_start_time).seconds // 60} мин"
+            uptime = (datetime.now() - self.bot_start_time).seconds
+            hours = uptime // 3600
+            minutes = (uptime % 3600) // 60
+            return f"""
+            <h1>🤖 LeakTracker Bot</h1>
+            <p>✅ Бот работает! Uptime: {hours}ч {minutes}м</p>
+            <p>🔗 <a href="/health">Health Check</a></p>
+            <p>🏓 <a href="/ping">Ping</a></p>
+            <p>📊 Нарушителей: {len(self.leaks_by_user)}</p>
+            """
         
         @app.route('/health')
         def health():
             return {
                 "status": "active",
-                "uptime": (datetime.now() - self.bot_start_time).seconds,
+                "service": "telegram-leak-bot",
+                "uptime_seconds": (datetime.now() - self.bot_start_time).seconds,
                 "ping_count": self.ping_count,
                 "leak_count": len(self.leaks_by_user),
-                "last_ping": self.last_successful_ping.isoformat() if self.last_successful_ping else None
+                "user_count": len(self.user_info),
+                "last_ping": self.last_successful_ping.isoformat() if self.last_successful_ping else None,
+                "self_ping_enabled": self.self_ping_enabled
             }
         
         @app.route('/ping')
-        def ping_endpoint():
+        def ping():
             self.ping_count += 1
             self.last_successful_ping = datetime.now()
-            return f"🏓 PONG! Ping #{self.ping_count} at {datetime.now().strftime('%H:%M:%S')}"
+            return {
+                "status": "pong",
+                "ping_number": self.ping_count,
+                "timestamp": datetime.now().isoformat(),
+                "message": f"🏓 PONG! Ping #{self.ping_count}"
+            }
+    
+    def start_background_tasks(self):
+        """Запуск фоновых задач"""
+        def self_ping_task():
+            """Задача самопинга для предотвращения сна на Render"""
+            while self.is_running:
+                if self.self_ping_enabled:
+                    self.perform_self_ping()
+                time.sleep(SELF_PING_INTERVAL)  # Используем значение из переменных
+        
+        def auto_save_task():
+            """Автосохранение данных"""
+            while self.is_running:
+                time.sleep(AUTO_SAVE_INTERVAL)  # Используем значение из переменных
+                self.save_data()
+                logger.debug("💾 Данные автосохранены")
+        
+        # Запускаем задачи в отдельных потоках
+        threading.Thread(target=self_ping_task, daemon=True).start()
+        threading.Thread(target=auto_save_task, daemon=True).start()
+        
+        logger.info(f"🔄 Фоновые задачи запущены: самопинг каждые {SELF_PING_INTERVAL}с, автосохранение каждые {AUTO_SAVE_INTERVAL}с")
     
     def perform_self_ping(self):
-        """Выполнение самопинга - бот сам себя будит"""
+        """Выполнение самопинга"""
         try:
-            # Пинг 1: Pingdom-стиль - запрос к корневому URL
-            response1 = requests.get(RENDER_URL, timeout=10)
+            # Пробуем несколько эндпоинтов
+            endpoints = [
+                f"{RENDER_URL}",
+                f"{RENDER_URL}/health",
+                f"{RENDER_URL}/ping"
+            ]
             
-            # Пинг 2: Запрос к health endpoint
-            response2 = requests.get(f"{RENDER_URL}/health", timeout=10)
-            
-            # Пинг 3: Запрос к ping endpoint
-            response3 = requests.get(f"{RENDER_URL}/ping", timeout=10)
+            for endpoint in endpoints:
+                response = requests.get(endpoint, timeout=15)
+                if response.status_code == 200:
+                    logger.debug(f"✅ Успешный пинг {endpoint}")
             
             self.ping_count += 1
             self.last_successful_ping = datetime.now()
             
-            logger.info(f"✅ Самопинг #{self.ping_count} выполнен успешно")
-            logger.info(f"   Статусы: {response1.status_code}, {response2.status_code}, {response3.status_code}")
-            
-            # Если пинги успешны, отправляем уведомление в телеграм (раз в 100 пингов)
-            if self.ping_count % 100 == 0:
-                self.send_ping_report()
+            # Раз в 50 пингов логируем подробнее
+            if self.ping_count % 50 == 0:
+                logger.info(f"✅ Самопинг #{self.ping_count} выполнен успешно")
                 
         except Exception as e:
-            logger.error(f"❌ Ошибка самопинга: {e}")
-            
-            # Пытаемся восстановиться - отправляем уведомление владельцу
-            try:
-                self.updater.bot.send_message(
-                    chat_id=YOUR_ID,
-                    text=f"⚠️ Ошибка самопинга: {str(e)[:200]}"
-                )
-            except:
-                pass
-    
-    def send_ping_report(self):
-        """Отправка отчета о самопинге владельцу"""
-        try:
-            uptime = (datetime.now() - self.bot_start_time).seconds
-            hours = uptime // 3600
-            minutes = (uptime % 3600) // 60
-            
-            report = f"📊 ОТЧЕТ САМОПИНГА\n\n"
-            report += f"✅ Бот активен: {hours}ч {minutes}м\n"
-            report += f"🔁 Всего пингов: {self.ping_count}\n"
-            report += f"📈 Обнаружено нарушителей: {len(self.leaks_by_user)}\n"
-            report += f"👤 Мониторится пользователей: {len(self.user_info)}\n"
-            report += f"🕒 Последний пинг: {self.last_successful_ping.strftime('%H:%M:%S') if self.last_successful_ping else 'Никогда'}\n"
-            report += f"🔗 URL: {RENDER_URL}"
-            
-            self.updater.bot.send_message(
-                chat_id=YOUR_ID,
-                text=report
-            )
-        except Exception as e:
-            logger.error(f"Не удалось отправить отчет: {e}")
+            logger.warning(f"⚠️ Ошибка самопинга: {str(e)[:100]}")
     
     def monitor_messages(self, update: Update, context: CallbackContext):
         """Мониторинг сообщений на утечки"""
@@ -165,6 +181,7 @@ class SelfPingBot:
             return
         
         user_id = msg.from_user.id
+        chat_id = msg.chat.id
         
         # Сохраняем информацию о пользователе
         if user_id not in self.user_info:
@@ -172,127 +189,169 @@ class SelfPingBot:
                 'username': msg.from_user.username or f"id{user_id}",
                 'first_name': msg.from_user.first_name or "",
                 'last_name': msg.from_user.last_name or "",
-                'last_seen': datetime.now().isoformat()
+                'last_seen': datetime.now().isoformat(),
+                'first_seen': datetime.now().isoformat()
             }
+        else:
+            self.user_info[user_id]['last_seen'] = datetime.now().isoformat()
         
         # Проверяем на утечки
-        leak_detected = False
+        leak_info = self.detect_leak(msg)
+        
+        if leak_info:
+            self.handle_leak(user_id, leak_info, msg, context)
+    
+    def detect_leak(self, msg):
+        """Обнаружение утечки в сообщении"""
         leak_type = None
         leak_details = ""
         
         # 1. ПРОВЕРКА ПЕРЕСЫЛКИ
         if msg.forward_from_chat:
-            leak_detected = True
             leak_type = "ПЕРЕСЫЛКА В ЧАТ"
             leak_details = f"В чат: {msg.forward_from_chat.title}"
             
         elif msg.forward_from:
-            leak_detected = True
             leak_type = "ПЕРЕСЫЛКА ПОЛЬЗОВАТЕЛЮ"
             target = msg.forward_from.username or f"id{msg.forward_from.id}"
             leak_details = f"Пользователю: {target}"
         
-        # 2. ПРОВЕРКА ССЫЛОК НА СООБЩЕНИЯ
+        # 2. ПРОВЕРКА ССЫЛОК
         elif msg.text or msg.caption:
             text = msg.text or msg.caption
             chat_id = msg.chat.id
             
-            if 't.me/c/' in text or (f"t.me/{str(chat_id).replace('-100', '')}" in text):
-                leak_detected = True
+            # Ссылки на сообщения Telegram
+            telegram_link_pattern = r't\.me/(?:c/)?[a-zA-Z0-9_\-/]+'
+            if re.search(telegram_link_pattern, text):
                 leak_type = "КОПИРОВАНИЕ ССЫЛКИ"
                 leak_details = "Скопировал ссылку на сообщение"
             
-            elif len(text) > 500 and '\n' in text and ':' in text:
-                leak_detected = True
+            # Длинные тексты (возможно копирование)
+            elif len(text) > 300 and '\n' in text:
                 leak_type = "КОПИРОВАНИЕ ТЕКСТА"
                 leak_details = f"Скопировал {len(text)} символов"
         
         # 3. ПРОВЕРКА НА СКРИНШОТ
-        screenshot_risk = self.check_screenshot_risk(msg)
-        if screenshot_risk > 70:
-            leak_detected = True
+        screenshot_score = self.calculate_screenshot_score(msg)
+        if screenshot_score > 75:
             leak_type = "ПОДОЗРЕНИЕ НА СКРИНШОТ"
-            leak_details = f"Уровень риска: {screenshot_risk}%"
+            leak_details = f"Вероятность скриншота: {screenshot_score}%"
         
-        # Если обнаружена утечка
-        if leak_detected:
-            self.record_leak(user_id, leak_type, leak_details, msg)
-            self.send_alert_to_owner(user_id, leak_type, leak_details, msg, context)
+        if leak_type:
+            return {
+                'type': leak_type,
+                'details': leak_details,
+                'timestamp': datetime.now().isoformat(),
+                'chat_id': msg.chat.id,
+                'chat_title': msg.chat.title or f"Чат {msg.chat.id}",
+                'message_id': msg.message_id
+            }
+        
+        return None
     
-    def check_screenshot_risk(self, msg):
-        """Проверка риска скриншота"""
-        risk = 0
+    def calculate_screenshot_score(self, msg):
+        """Вычисление вероятности скриншота"""
+        score = 0
         
+        # Признаки скриншота:
+        
+        # 1. Реакция на старое сообщение
         if hasattr(msg, 'reply_to_message') and msg.reply_to_message:
-            original_time = msg.reply_to_message.date
-            current_time = msg.date
-            time_diff = (current_time - original_time).total_seconds()
-            
-            if time_diff > 300:
-                risk += 40
+            time_diff = (msg.date - msg.reply_to_message.date).total_seconds()
+            if time_diff > 180:  # Более 3 минут
+                score += 30
         
-        if msg.text and len(msg.text) < 10 and any(c in msg.text for c in ['📸', '🖼', '💾', '👇', '⬆️', '⬇️']):
-            risk += 30
+        # 2. Короткое сообщение с эмодзи
+        if msg.text and len(msg.text) < 15:
+            screenshot_emojis = ['📸', '🖼', '💾', '📱', '📲', '⬇️', '⬆️', '👇', '👆']
+            if any(emoji in msg.text for emoji in screenshot_emojis):
+                score += 40
         
-        return risk
+        # 3. Сохранение медиа
+        if msg.photo or msg.video or msg.document:
+            score += 20
+        
+        return min(score, 100)
     
-    def record_leak(self, user_id, leak_type, details, msg):
-        """Запись утечки в базу"""
-        leak_record = {
-            'timestamp': datetime.now().isoformat(),
-            'type': leak_type,
-            'details': details,
-            'chat_id': msg.chat.id,
-            'chat_title': msg.chat.title or f"Чат {msg.chat.id}",
-            'message_id': msg.message_id
-        }
+    def handle_leak(self, user_id, leak_info, msg, context):
+        """Обработка обнаруженной утечки"""
+        # Сохраняем утечку
+        self.leaks_by_user[user_id].append(leak_info)
         
-        self.leaks_by_user[user_id].append(leak_record)
+        # Ограничиваем историю до 50 нарушений на пользователя
+        if len(self.leaks_by_user[user_id]) > 50:
+            self.leaks_by_user[user_id] = self.leaks_by_user[user_id][-50:]
         
-        if len(self.leaks_by_user[user_id]) > 100:
-            self.leaks_by_user[user_id] = self.leaks_by_user[user_id][-100:]
+        # Отправляем уведомление владельцу
+        self.send_leak_alert(user_id, leak_info, msg, context)
+        
+        # Автосохранение
+        self.save_data()
     
-    def send_alert_to_owner(self, user_id, leak_type, details, msg, context):
-        """Отправка уведомления владельцу в ЛС"""
+    def send_leak_alert(self, user_id, leak_info, msg, context):
+        """Отправка уведомления о утечке владельцу"""
         user = self.user_info.get(user_id, {'username': f'id{user_id}', 'first_name': ''})
         
         alert = f"🚨 ОБНАРУЖЕНА УТЕЧКА\n\n"
-        alert += f"Нарушитель: @{user['username']}\n"
-        alert += f"Имя: {user['first_name']} {user.get('last_name', '')}\n"
-        alert += f"ID: {user_id}\n"
-        alert += f"Чат: {msg.chat.title}\n"
-        alert += f"Время: {datetime.now().strftime('%H:%M:%S')}\n\n"
-        alert += f"Тип нарушения: {leak_type}\n"
-        alert += f"Детали: {details}"
+        alert += f"👤 Нарушитель: @{user['username']}\n"
+        alert += f"📛 Имя: {user['first_name']} {user.get('last_name', '')}\n"
+        alert += f"🆔 ID: {user_id}\n"
+        alert += f"💬 Чат: {msg.chat.title}\n"
+        alert += f"⏰ Время: {datetime.now().strftime('%H:%M:%S')}\n\n"
+        alert += f"📌 Тип нарушения: {leak_info['type']}\n"
+        alert += f"📝 Детали: {leak_info['details']}\n\n"
+        alert += f"📊 Всего нарушений у этого пользователя: {len(self.leaks_by_user[user_id])}"
         
         try:
             context.bot.send_message(
                 chat_id=YOUR_ID,
                 text=alert
             )
-            logger.info(f"Уведомление отправлено владельцу о пользователе {user_id}")
+            logger.info(f"📤 Уведомление отправлено владельцу о пользователе {user_id}")
         except Exception as e:
-            logger.error(f"Не удалось отправить уведомление: {e}")
+            logger.error(f"❌ Не удалось отправить уведомление: {e}")
     
     # ========== КОМАНДЫ БОТА ==========
     
-    def start_cmd(self, update: Update, context: CallbackContext):
-        help_text = "🛡️ LeakTracker Bot (Self-Ping Edition)\n\n"
-        help_text += "Я отслеживаю утечки из чатов и отправляю уведомления вам в ЛС.\n"
-        help_text += "Бот автоматически поддерживает свою работу 24/7.\n\n"
-        help_text += "Команды:\n"
+    def start_command(self, update: Update, context: CallbackContext):
+        """Команда /start"""
+        update.message.reply_text(
+            "🛡️ LeakTracker Bot\n\n"
+            "Я отслеживаю утечки информации из чатов.\n"
+            "При обнаружении подозрительной активности я отправляю уведомление владельцу.\n\n"
+            "📋 Доступные команды:\n"
+            "/leakstats - таблица нарушителей\n"
+            "/leakinfo [id] - информация о нарушителе\n"
+            "/status - статус бота\n"
+            "/help - справка"
+        )
+    
+    def help_command(self, update: Update, context: CallbackContext):
+        """Команда /help"""
+        help_text = "📖 СПРАВКА ПО КОМАНДАМ\n\n"
+        help_text += "/start - информация о боте\n"
+        help_text += "/help - эта справка\n"
         help_text += "/leakstats - таблица всех нарушителей\n"
-        help_text += "/pingstatus - статус самопинга\n"
-        help_text += "/toggleping - вкл/выкл самопинг\n"
+        help_text += "/leakinfo [id] - подробная информация о нарушителе\n"
+        help_text += "/status - статус работы бота\n"
+        help_text += "/pingstatus - статус самопинга (только для владельца)\n"
+        help_text += "/toggleping - вкл/выкл самопинг (только для владельца)\n"
+        help_text += "/clear - очистить данные (только для владельца)\n\n"
+        help_text += "👁️ Бот автоматически отслеживает:\n"
+        help_text += "• Пересылки сообщений\n"
+        help_text += "• Копирование ссылок на сообщения\n"
+        help_text += "• Подозрительную активность (скриншоты)"
         
         update.message.reply_text(help_text)
     
-    def leakstats_cmd(self, update: Update, context: CallbackContext):
-        """Таблица нарушителей"""
+    def leakstats_command(self, update: Update, context: CallbackContext):
+        """Команда /leakstats - таблица нарушителей"""
         if not self.leaks_by_user:
-            update.message.reply_text("Нарушителей не обнаружено")
+            update.message.reply_text("📭 Нарушителей не обнаружено")
             return
         
+        # Подготавливаем данные
         stats = []
         for user_id, leaks in self.leaks_by_user.items():
             if not leaks:
@@ -300,47 +359,102 @@ class SelfPingBot:
             
             user = self.user_info.get(user_id, {'username': f'id{user_id}', 'first_name': ''})
             
-            counts = defaultdict(int)
-            for leak in leaks:
-                counts[leak['type']] += 1
+            # Подсчет нарушений по типам
+            leak_types = {}
+            for leak in leaks[-20:]:  # Берем последние 20 нарушений
+                leak_type = leak['type']
+                leak_types[leak_type] = leak_types.get(leak_type, 0) + 1
             
             stats.append({
                 'user_id': user_id,
                 'username': user['username'],
-                'name': f"{user['first_name']} {user.get('last_name', '')}".strip(),
-                'total': len(leaks),
-                'counts': dict(counts)
+                'total_leaks': len(leaks),
+                'leak_types': leak_types
             })
         
-        stats.sort(key=lambda x: x['total'], reverse=True)
+        # Сортируем по количеству нарушений
+        stats.sort(key=lambda x: x['total_leaks'], reverse=True)
         
+        # Формируем таблицу
         table = "📊 ТАБЛИЦА НАРУШИТЕЛЕЙ\n\n"
-        table += "┌──────────────┬────────────────┬─────────────────────────────────────────────┐\n"
-        table += "│ Пользователь │ Всего нарушений │ Типы нарушений                            │\n"
-        table += "├──────────────┼────────────────┼─────────────────────────────────────────────┤\n"
+        table += "┌──────────────┬────────────────┬─────────────────────────────┐\n"
+        table += "│ Пользователь │ Всего нарушений │ Основные типы нарушений    │\n"
+        table += "├──────────────┼────────────────┼─────────────────────────────┤\n"
         
-        for stat in stats[:20]:
-            username = stat['username'] or f"id{stat['user_id']}"
-            name = stat['name'][:10] + "..." if len(stat['name']) > 10 else stat['name']
+        for stat in stats[:15]:  # Показываем топ-15
+            username = f"@{stat['username']}" if stat['username'].startswith('id') == False else stat['username']
+            username_display = username[:12].ljust(12)
             
-            type_str = ""
-            for leak_type, count in stat['counts'].items():
-                short_type = leak_type[:15] + "..." if len(leak_type) > 15 else leak_type
-                type_str += f"{short_type}: {count}, "
-            type_str = type_str.rstrip(", ")
+            # Формируем строку с типами нарушений
+            types_str = ""
+            for leak_type, count in list(stat['leak_types'].items())[:3]:  # Берем первые 3 типа
+                short_type = leak_type[:8] + ".." if len(leak_type) > 8 else leak_type
+                types_str += f"{short_type}:{count} "
             
-            table += f"│ @{username:<12} │ {stat['total']:<14} │ {type_str:<43} │\n"
+            table += f"│ {username_display} │ {stat['total_leaks']:<14} │ {types_str:<27} │\n"
         
-        table += "└──────────────┴────────────────┴─────────────────────────────────────────────┘\n"
-        table += f"\nВсего нарушителей: {len(stats)}"
+        table += "└──────────────┴────────────────┴─────────────────────────────┘\n"
+        table += f"\n📈 Всего нарушителей: {len(stats)}"
+        table += f"\n🕒 Последнее обновление: {datetime.now().strftime('%H:%M:%S')}"
         
         update.message.reply_text(f"<pre>{table}</pre>", parse_mode='HTML')
     
-    def pingstatus_cmd(self, update: Update, context: CallbackContext):
-        """Статус самопинга"""
-        user_id = update.message.from_user.id
+    def leakinfo_command(self, update: Update, context: CallbackContext):
+        """Команда /leakinfo - информация о нарушителе"""
+        if not context.args:
+            update.message.reply_text("ℹ️ Использование: /leakinfo [ID пользователя или @username]")
+            return
         
-        if user_id != YOUR_ID:
+        target = context.args[0].replace('@', '')
+        
+        # Ищем пользователя
+        user_id = None
+        for uid, info in self.user_info.items():
+            if info['username'] == target or str(uid) == target:
+                user_id = uid
+                break
+        
+        if not user_id or user_id not in self.leaks_by_user:
+            update.message.reply_text("❌ Пользователь не найден или нарушений нет")
+            return
+        
+        leaks = self.leaks_by_user[user_id]
+        user = self.user_info[user_id]
+        
+        # Формируем отчет
+        report = f"🔍 ИНФОРМАЦИЯ О НАРУШИТЕЛЕ\n\n"
+        report += f"👤 Пользователь: @{user['username']}\n"
+        report += f"🆔 ID: {user_id}\n"
+        report += f"📛 Имя: {user['first_name']} {user.get('last_name', '')}\n"
+        report += f"📅 Первый раз замечен: {user.get('first_seen', 'Неизвестно')}\n"
+        report += f"📅 Последняя активность: {user.get('last_seen', 'Неизвестно')}\n\n"
+        report += f"🚨 Всего нарушений: {len(leaks)}\n\n"
+        
+        # Статистика по типам нарушений
+        type_stats = {}
+        for leak in leaks:
+            leak_type = leak['type']
+            type_stats[leak_type] = type_stats.get(leak_type, 0) + 1
+        
+        report += "📊 Статистика по типам:\n"
+        for leak_type, count in type_stats.items():
+            percentage = (count / len(leaks)) * 100
+            report += f"  {leak_type}: {count} ({percentage:.1f}%)\n"
+        
+        # Последние 5 нарушений
+        if leaks:
+            report += f"\n🕒 Последние нарушения:\n"
+            for i, leak in enumerate(leaks[-5:][::-1], 1):
+                time_str = datetime.fromisoformat(leak['timestamp']).strftime("%d.%m %H:%M")
+                report += f"{i}. {time_str} - {leak['type']}\n"
+                if leak['details']:
+                    report += f"   {leak['details'][:50]}\n"
+        
+        update.message.reply_text(f"<pre>{report}</pre>", parse_mode='HTML')
+    
+    def pingstatus_command(self, update: Update, context: CallbackContext):
+        """Команда /pingstatus - статус самопинга"""
+        if update.message.from_user.id != YOUR_ID:
             update.message.reply_text("⛔ Эта команда только для владельца")
             return
         
@@ -348,92 +462,21 @@ class SelfPingBot:
         hours = uptime // 3600
         minutes = (uptime % 3600) // 60
         
-        status = f"📡 СТАТУС САМОПИНГА\n\n"
-        status += f"✅ Самопинг: {'ВКЛ' if self.self_ping_enabled else 'ВЫКЛ'}\n"
-        status += f"🔁 Всего пингов: {self.ping_count}\n"
-        status += f"⏰ Время работы: {hours}ч {minutes}м\n"
-        status += f"🕒 Последний успешный пинг: "
+        status = "🟢 ВКЛЮЧЕН" if self.self_ping_enabled else "🔴 ВЫКЛЮЧЕН"
+        
+        message = f"📡 СТАТУС САМОПИНГА\n\n"
+        message += f"Состояние: {status}\n"
+        message += f"Всего пингов: {self.ping_count}\n"
+        message += f"Время работы: {hours}ч {minutes}м\n"
+        message += f"Интервал пинга: {SELF_PING_INTERVAL} секунд\n"
         
         if self.last_successful_ping:
-            time_diff = (datetime.now() - self.last_successful_ping).seconds // 60
-            status += f"{self.last_successful_ping.strftime('%H:%M:%S')} ({time_diff} мин назад)\n"
+            last_ping_ago = (datetime.now() - self.last_successful_ping).seconds // 60
+            last_time = self.last_successful_ping.strftime("%H:%M:%S")
+            message += f"Последний пинг: {last_time} ({last_ping_ago} минут назад)\n"
         else:
-            status += "Никогда\n"
+            message += f"Последний пинг: Никогда\n"
         
-        status += f"🔗 URL приложения: {RENDER_URL}\n"
-        status += f"🌐 Health-check: {RENDER_URL}/health\n"
-        status += f"🏓 Ping endpoint: {RENDER_URL}/ping"
-        
-        update.message.reply_text(status)
-    
-    def toggleping_cmd(self, update: Update, context: CallbackContext):
-        """Включение/выключение самопинга"""
-        user_id = update.message.from_user.id
-        
-        if user_id != YOUR_ID:
-            update.message.reply_text("⛔ Эта команда только для владельца")
-            return
-        
-        self.self_ping_enabled = not self.self_ping_enabled
-        status = "ВКЛЮЧЕН" if self.self_ping_enabled else "ВЫКЛЮЧЕН"
-        
-        update.message.reply_text(f"🔄 Самопинг теперь {status}")
-        
-        # Если включили, сразу выполняем пинг
-        if self.self_ping_enabled:
-            threading.Thread(target=self.perform_self_ping, daemon=True).start()
-    
-    def load_data(self):
-        """Загрузка данных"""
-        try:
-            if os.path.exists('leak_data.json'):
-                with open('leak_data.json', 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                    self.leaks_by_user = defaultdict(list, {int(k): v for k, v in data.get('leaks', {}).items()})
-                    self.user_info = {int(k): v for k, v in data.get('users', {}).items()}
-        except Exception as e:
-            logger.error(f"Ошибка загрузки данных: {e}")
-    
-    def save_data(self):
-        """Сохранение данных"""
-        try:
-            data = {
-                'leaks': dict(self.leaks_by_user),
-                'users': self.user_info,
-                'last_update': datetime.now().isoformat()
-            }
-            
-            with open('leak_data.json', 'w', encoding='utf-8') as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            logger.error(f"Ошибка сохранения данных: {e}")
-    
-    def run(self):
-        """Запуск бота и Flask приложения"""
-        # Запуск Flask в отдельном потоке
-        def run_flask():
-            app.run(host='0.0.0.0', port=PORT, debug=False, use_reloader=False)
-        
-        flask_thread = threading.Thread(target=run_flask, daemon=True)
-        flask_thread.start()
-        
-        # Запуск бота
-        logger.info(f"🤖 Бот запущен на порту {PORT}")
-        logger.info(f"🌐 URL: {RENDER_URL}")
-        logger.info(f"🏓 Самопинг: {'Включен' if self.self_ping_enabled else 'Выключен'}")
-        
-        # Первый самопинг при запуске
-        if self.self_ping_enabled:
-            self.perform_self_ping()
-        
-        # Запуск бота в режиме polling (на Render лучше использовать webhooks, но для простоты polling)
-        self.updater.start_polling()
-        self.updater.idle()
-
-# ========== ЗАПУСК ==========
-if __name__ == '__main__':
-    try:
-        bot = SelfPingBot()
-        bot.run()
-    except Exception as e:
-        logger.error(f"Критическая ошибка: {e}")
+        message += f"\n🔗 URL приложения: {RENDER_URL}"
+        message += f"\n🏓 Ping endpoint: {RENDER_URL}/ping"
+        message += f"\n❤️ Health 
