@@ -3,757 +3,612 @@ import json
 import time
 import re
 import asyncio
-from datetime import datetime, timedelta
+import hashlib
+import sqlite3
+from datetime import datetime
 from flask import Flask, request, jsonify, render_template
 import requests
-from typing import Dict, List, Optional, Tuple
-import hashlib
+import logging
+from typing import Dict, List, Set, Tuple
+from collections import defaultdict
 
 # ========== КОНФИГУРАЦИЯ ==========
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 ALLOWED_IDS = [int(x.strip()) for x in os.environ.get("ALLOWED_IDS", "").split(",") if x.strip()]
+ADMIN_IDS = [int(x.strip()) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip()] or ALLOWED_IDS
 PORT = int(os.environ.get("PORT", 10000))
 
-print("="*70)
-print("🤖 TELEGRAM INTEGRATED LEAK DETECTOR")
-print("="*70)
-print(f"Token: {'✓' if TELEGRAM_TOKEN else '✗'}")
-print(f"Allowed IDs: {ALLOWED_IDS}")
-print(f"Mode: REAL-TIME TELEGRAM MONITORING")
-print("="*70)
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# ========== TELEGRAM API КЛАСС ==========
-class TelegramAPI:
-    def __init__(self, token: str):
+# ========== ТЕЛЕГРАМ API ==========
+class TelegramMonitor:
+    def __init__(self, token):
         self.token = token
         self.base_url = f"https://api.telegram.org/bot{token}"
         
-    def make_request(self, method: str, data: dict = None) -> dict:
-        """Выполнить запрос к Telegram API"""
+    def send_message(self, chat_id, text, parse_mode="HTML"):
+        """Отправить сообщение в Telegram"""
         try:
-            url = f"{self.base_url}/{method}"
-            response = requests.post(url, json=data, timeout=15)
+            url = f"{self.base_url}/sendMessage"
+            data = {
+                "chat_id": chat_id,
+                "text": text,
+                "parse_mode": parse_mode,
+                "disable_web_page_preview": True
+            }
+            response = requests.post(url, json=data, timeout=10)
             return response.json()
         except Exception as e:
-            print(f"Telegram API error: {e}")
-            return {"ok": False, "error": str(e)}
+            logger.error(f"Send message error: {e}")
+            return {"ok": False}
     
-    def get_chat_info(self, chat_id: int) -> dict:
+    def get_chat_member(self, chat_id, user_id):
+        """Получить информацию об участнике чата"""
+        try:
+            url = f"{self.base_url}/getChatMember"
+            data = {"chat_id": chat_id, "user_id": user_id}
+            response = requests.post(url, json=data, timeout=10)
+            return response.json()
+        except Exception as e:
+            logger.error(f"Get chat member error: {e}")
+            return {"ok": False}
+    
+    def get_chat(self, chat_id):
         """Получить информацию о чате"""
-        return self.make_request("getChat", {"chat_id": chat_id})
-    
-    def get_chat_members(self, chat_id: int) -> dict:
-        """Получить список участников чата"""
-        return self.make_request("getChatMembersCount", {"chat_id": chat_id})
-    
-    def get_message(self, chat_id: int, message_id: int) -> dict:
-        """Получить информацию о сообщении"""
-        return self.make_request("getMessage", {"chat_id": chat_id, "message_id": message_id})
-    
-    def get_chat_history(self, chat_id: int, limit: int = 100) -> dict:
-        """Получить историю чата"""
-        return self.make_request("getChatHistory", {
-            "chat_id": chat_id,
-            "limit": limit
-        })
-    
-    def forward_message(self, from_chat_id: int, to_chat_id: int, message_id: int) -> dict:
-        """Переслать сообщение"""
-        return self.make_request("forwardMessage", {
-            "chat_id": to_chat_id,
-            "from_chat_id": from_chat_id,
-            "message_id": message_id
-        })
+        try:
+            url = f"{self.base_url}/getChat"
+            data = {"chat_id": chat_id}
+            response = requests.post(url, json=data, timeout=10)
+            return response.json()
+        except Exception as e:
+            logger.error(f"Get chat error: {e}")
+            return {"ok": False}
 
-# ========== ИНТЕГРИРОВАННОЕ ХРАНИЛИЩЕ ==========
-class IntegratedStorage:
+# ========== БАЗА ДАННЫХ МОНИТОРИНГА ==========
+class ScreenshotMonitorDB:
     def __init__(self):
-        self.telegram_api = TelegramAPI(TELEGRAM_TOKEN)
-        
-        # Мониторинг чатов
-        self.monitored_chats = set()  # Чаты которые мониторим
-        self.chat_metadata = {}       # Метаданные чатов
-        
-        # Сообщения
-        self.messages = []
-        self.message_hashes = set()   # Для предотвращения дублей
-        
-        # Пользователи
-        self.users = {}
-        
-        # Утечки
-        self.leaks = {
-            "forwarded_messages": [],     # Пересланные сообщения
-            "copied_content": [],         # Скопированный контент
-            "external_shares": [],        # Внешние ссылки
-            "suspicious_activity": [],    # Подозрительная активность
-        }
-        
-        self.load()
+        self.conn = sqlite3.connect('screenshot_monitor.db', check_same_thread=False)
+        self.cursor = self.conn.cursor()
+        self.init_tables()
     
-    def save(self):
-        """Сохранить данные"""
-        try:
-            data = {
-                "monitored_chats": list(self.monitored_chats),
-                "chat_metadata": self.chat_metadata,
-                "messages": self.messages[-5000:],
-                "users": self.users,
-                "leaks": self.leaks,
-                "saved_at": datetime.now().isoformat()
-            }
-            
-            with open("integrated_data.json", "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2, ensure_ascii=False)
-                
-            print(f"💾 Saved: {len(self.messages)} messages, {self.get_total_leaks()} leaks")
-        except Exception as e:
-            print(f"Save error: {e}")
+    def init_tables(self):
+        """Инициализация таблиц базы данных"""
+        # Таблица для отслеживания скриншотов
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS screenshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER,
+                user_id INTEGER,
+                username TEXT,
+                first_name TEXT,
+                message_id INTEGER,
+                screenshot_type TEXT,
+                detected_at TIMESTAMP,
+                message_text TEXT,
+                forwarded_from TEXT
+            )
+        ''')
+        
+        # Таблица для пересланных сообщений
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS forwarded_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                original_chat_id INTEGER,
+                original_message_id INTEGER,
+                forwarded_chat_id INTEGER,
+                forwarded_message_id INTEGER,
+                user_id INTEGER,
+                username TEXT,
+                forwarded_at TIMESTAMP,
+                message_content TEXT,
+                is_to_pm INTEGER DEFAULT 0
+            )
+        ''')
+        
+        # Таблица для копирования сообщений
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS copied_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER,
+                user_id INTEGER,
+                username TEXT,
+                message_id INTEGER,
+                copied_text TEXT,
+                copied_at TIMESTAMP,
+                detection_method TEXT
+            )
+        ''')
+        
+        # Таблица пользователей
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                first_name TEXT,
+                last_name TEXT,
+                is_bot INTEGER DEFAULT 0,
+                first_seen TIMESTAMP,
+                last_activity TIMESTAMP,
+                total_screenshots INTEGER DEFAULT 0,
+                total_forwards INTEGER DEFAULT 0,
+                total_copies INTEGER DEFAULT 0,
+                suspicious_score INTEGER DEFAULT 0
+            )
+        ''')
+        
+        # Таблица чатов
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS chats (
+                chat_id INTEGER PRIMARY KEY,
+                title TEXT,
+                username TEXT,
+                type TEXT,
+                added_to_monitoring TIMESTAMP,
+                is_active INTEGER DEFAULT 1
+            )
+        ''')
+        
+        self.conn.commit()
     
-    def load(self):
-        """Загрузить данные"""
-        try:
-            if os.path.exists("integrated_data.json"):
-                with open("integrated_data.json", "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                
-                self.monitored_chats = set(data.get("monitored_chats", []))
-                self.chat_metadata = data.get("chat_metadata", {})
-                self.messages = data.get("messages", [])
-                self.users = data.get("users", {})
-                self.leaks = data.get("leaks", {
-                    "forwarded_messages": [],
-                    "copied_content": [],
-                    "external_shares": [],
-                    "suspicious_activity": []
-                })
-                
-                # Восстановление хэшей
-                self.message_hashes = {self._get_message_hash(m) for m in self.messages}
-                
-                print(f"📂 Loaded: {len(self.messages)} msgs, {self.get_total_leaks()} leaks, {len(self.monitored_chats)} chats")
-        except Exception as e:
-            print(f"Load error: {e}")
+    def add_screenshot_event(self, chat_id, user_id, username, first_name, message_id, screenshot_type, message_text, forwarded_from=None):
+        """Добавить запись о скриншоте"""
+        self.cursor.execute('''
+            INSERT INTO screenshots 
+            (chat_id, user_id, username, first_name, message_id, screenshot_type, detected_at, message_text, forwarded_from)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (chat_id, user_id, username, first_name, message_id, screenshot_type, datetime.now(), message_text, forwarded_from))
+        
+        # Обновить статистику пользователя
+        self.cursor.execute('''
+            INSERT OR IGNORE INTO users (user_id, username, first_name, first_seen, last_activity)
+            VALUES (?, ?, ?, ?, ?)
+        ''', (user_id, username, first_name, datetime.now(), datetime.now()))
+        
+        self.cursor.execute('''
+            UPDATE users 
+            SET total_screenshots = total_screenshots + 1,
+                last_activity = ?,
+                suspicious_score = suspicious_score + 5
+            WHERE user_id = ?
+        ''', (datetime.now(), user_id))
+        
+        self.conn.commit()
+        return self.cursor.lastrowid
     
-    def _get_message_hash(self, message: dict) -> str:
-        """Получить уникальный хэш сообщения"""
-        text = message.get("text", "") or message.get("caption", "")
-        return hashlib.md5(f"{message.get('chat_id')}_{message.get('message_id')}_{text}".encode()).hexdigest()
+    def add_forward_event(self, original_chat_id, original_message_id, forwarded_chat_id, forwarded_message_id, user_id, username, message_content, is_to_pm=False):
+        """Добавить запись о пересылке"""
+        self.cursor.execute('''
+            INSERT INTO forwarded_messages 
+            (original_chat_id, original_message_id, forwarded_chat_id, forwarded_message_id, user_id, username, forwarded_at, message_content, is_to_pm)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (original_chat_id, original_message_id, forwarded_chat_id, forwarded_message_id, user_id, username, datetime.now(), message_content, 1 if is_to_pm else 0))
+        
+        # Обновить статистику пользователя
+        self.cursor.execute('''
+            UPDATE users 
+            SET total_forwards = total_forwards + 1,
+                last_activity = ?,
+                suspicious_score = suspicious_score + (10 if ? = 1 else 3)
+            WHERE user_id = ?
+        ''', (datetime.now(), 1 if is_to_pm else 0, user_id))
+        
+        self.conn.commit()
+        return self.cursor.lastrowid
     
-    def get_total_leaks(self) -> int:
-        """Общее количество утечек"""
-        return sum(len(leaks) for leaks in self.leaks.values())
+    def add_copy_event(self, chat_id, user_id, username, message_id, copied_text, detection_method):
+        """Добавить запись о копировании"""
+        self.cursor.execute('''
+            INSERT INTO copied_messages 
+            (chat_id, user_id, username, message_id, copied_text, copied_at, detection_method)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        ''', (chat_id, user_id, username, message_id, copied_text, datetime.now(), detection_method))
+        
+        # Обновить статистику пользователя
+        self.cursor.execute('''
+            UPDATE users 
+            SET total_copies = total_copies + 1,
+                last_activity = ?,
+                suspicious_score = suspicious_score + 2
+            WHERE user_id = ?
+        ''', (datetime.now(), user_id))
+        
+        self.conn.commit()
+        return self.cursor.lastrowid
     
-    def add_monitored_chat(self, chat_id: int, chat_info: dict = None):
+    def add_chat(self, chat_id, title, username, chat_type):
         """Добавить чат в мониторинг"""
-        self.monitored_chats.add(chat_id)
-        
-        if chat_info:
-            self.chat_metadata[str(chat_id)] = {
-                "id": chat_id,
-                "title": chat_info.get("title", f"Chat {chat_id}"),
-                "type": chat_info.get("type", ""),
-                "username": chat_info.get("username", ""),
-                "added_at": datetime.now().isoformat(),
-                "last_checked": datetime.now().isoformat()
-            }
-        
-        print(f"➕ Мониторинг чата: {chat_info.get('title', chat_id) if chat_info else chat_id}")
+        self.cursor.execute('''
+            INSERT OR REPLACE INTO chats (chat_id, title, username, type, added_to_monitoring)
+            VALUES (?, ?, ?, ?, ?)
+        ''', (chat_id, title, username or "", chat_type, datetime.now()))
+        self.conn.commit()
     
-    def analyze_telegram_message(self, message: dict) -> dict:
-        """Анализ сообщения через Telegram API"""
-        analysis = {
-            "is_forwarded": False,
-            "has_external_links": False,
-            "contains_media": False,
-            "reply_to_forward": False,
-            "forward_chain": False,
-            "suspicious_patterns": []
+    def get_user_stats(self, user_id):
+        """Получить статистику пользователя"""
+        self.cursor.execute('''
+            SELECT * FROM users WHERE user_id = ?
+        ''', (user_id,))
+        return self.cursor.fetchone()
+    
+    def get_recent_screenshots(self, limit=50):
+        """Получить последние скриншоты"""
+        self.cursor.execute('''
+            SELECT * FROM screenshots 
+            ORDER BY detected_at DESC 
+            LIMIT ?
+        ''', (limit,))
+        return self.cursor.fetchall()
+    
+    def get_recent_forwards(self, limit=50):
+        """Получить последние пересылки"""
+        self.cursor.execute('''
+            SELECT * FROM forwarded_messages 
+            ORDER BY forwarded_at DESC 
+            LIMIT ?
+        ''', (limit,))
+        return self.cursor.fetchall()
+    
+    def get_suspicious_users(self, limit=20):
+        """Получить подозрительных пользователей"""
+        self.cursor.execute('''
+            SELECT * FROM users 
+            WHERE suspicious_score > 0 
+            ORDER BY suspicious_score DESC 
+            LIMIT ?
+        ''', (limit,))
+        return self.cursor.fetchall()
+
+# ========== ОСНОВНОЙ КЛАСС МОНИТОРИНГА ==========
+class ScreenshotMonitor:
+    def __init__(self, token, allowed_ids):
+        self.tg = TelegramMonitor(token)
+        self.db = ScreenshotMonitorDB()
+        self.allowed_ids = allowed_ids
+        self.monitored_chats = set()
+        self.screenshot_patterns = [
+            "обнаружен снимок экрана",
+            "screenshot detected",
+            "скриншот обнаружен",
+            "снимок экрана",
+            "made a screenshot"
+        ]
+        
+        # Загружаем чаты из БД
+        self.load_monitored_chats()
+    
+    def load_monitored_chats(self):
+        """Загрузить чаты из базы данных"""
+        self.db.cursor.execute('SELECT chat_id FROM chats WHERE is_active = 1')
+        for row in self.db.cursor.fetchall():
+            self.monitored_chats.add(row[0])
+    
+    def detect_screenshot(self, message_text):
+        """Обнаружить упоминание скриншота в сообщении"""
+        if not message_text:
+            return False, None
+        
+        message_lower = message_text.lower()
+        for pattern in self.screenshot_patterns:
+            if pattern in message_lower:
+                return True, pattern
+        
+        return False, None
+    
+    def analyze_message(self, message_data):
+        """Анализировать сообщение на подозрительные действия"""
+        results = {
+            'is_screenshot': False,
+            'is_forward': False,
+            'is_copy': False,
+            'is_to_pm': False,
+            'details': {}
         }
         
-        # 1. Проверка на пересылку
-        if "forward_date" in message:
-            analysis["is_forwarded"] = True
+        # Проверка на пересылку
+        if 'forward_from_chat' in message_data or 'forward_from' in message_data:
+            results['is_forward'] = True
+            results['details']['forward_type'] = 'cross_chat' if 'forward_from_chat' in message_data else 'user'
             
-            # Проверяем источник пересылки
-            forward_from = message.get("forward_from_chat", {})
-            if forward_from:
-                forward_chat_id = forward_from.get("id")
-                # Если переслано из другого чата
-                if forward_chat_id and forward_chat_id != message.get("chat", {}).get("id"):
-                    analysis["suspicious_patterns"].append("cross_chat_forward")
+            # Проверка, переслано ли в ЛС
+            chat = message_data.get('chat', {})
+            if chat.get('type') == 'private':
+                results['is_to_pm'] = True
         
-        # 2. Проверка на медиа
-        if any(key in message for key in ["photo", "video", "document", "audio"]):
-            analysis["contains_media"] = True
-            
-            # Проверяем подписи к медиа
-            caption = message.get("caption", "")
-            if caption:
-                # Ищем ссылки в подписях
-                if re.search(r'https?://[^\s]+', caption):
-                    analysis["has_external_links"] = True
+        # Проверка текста на скриншоты
+        text = message_data.get('text', '') or message_data.get('caption', '')
+        is_screenshot, pattern = self.detect_screenshot(text)
+        if is_screenshot:
+            results['is_screenshot'] = True
+            results['details']['screenshot_pattern'] = pattern
         
-        # 3. Проверка текста на внешние ссылки
-        text = message.get("text", "")
-        if text:
-            # Ищем ссылки
-            links = re.findall(r'https?://[^\s]+', text)
-            if links:
-                analysis["has_external_links"] = True
-                
-                # Проверяем ссылки на популярные файлообменники
-                file_hosts = [
-                    "dropbox", "google.drive", "mega.nz", "yadi.sk",
-                    "disk.yandex", "cloud.mail", "telegram.me/file",
-                    "t.me/file"
-                ]
-                
-                for link in links:
-                    for host in file_hosts:
-                        if host in link.lower():
-                            analysis["suspicious_patterns"].append(f"file_hosting_{host}")
-                            break
-        
-        # 4. Проверка на ответ к пересланному сообщению
-        if "reply_to_message" in message and "forward_date" in message.get("reply_to_message", {}):
-            analysis["reply_to_forward"] = True
-            analysis["suspicious_patterns"].append("reply_to_forwarded")
-        
-        # 5. Проверка цепочки пересылок
-        if "forward_from_message_id" in message:
-            analysis["forward_chain"] = True
-        
-        return analysis
+        return results
     
-    def detect_leaks(self, message: dict, analysis: dict) -> List[Dict]:
-        """Обнаружение утечек на основе анализа"""
-        detected_leaks = []
-        chat_id = message.get("chat", {}).get("id")
-        user_id = message.get("from", {}).get("id")
-        message_id = message.get("message_id")
-        
-        # 1. Утечка через пересылку
-        if analysis["is_forwarded"]:
-            leak_data = {
-                "type": "forwarded_message",
-                "chat_id": chat_id,
-                "user_id": user_id,
-                "message_id": message_id,
-                "timestamp": datetime.now().isoformat(),
-                "confidence": 90,
-                "details": {
-                    "is_cross_chat": "cross_chat_forward" in analysis["suspicious_patterns"],
-                    "has_media": analysis["contains_media"],
-                    "source_chat": message.get("forward_from_chat", {}).get("title", "unknown")
-                }
-            }
-            detected_leaks.append(leak_data)
-            self.leaks["forwarded_messages"].append(leak_data)
-        
-        # 2. Утечка через внешние ссылки
-        if analysis["has_external_links"]:
-            leak_data = {
-                "type": "external_share",
-                "chat_id": chat_id,
-                "user_id": user_id,
-                "message_id": message_id,
-                "timestamp": datetime.now().isoformat(),
-                "confidence": 70,
-                "details": {
-                    "contains_file_links": any("file_hosting" in p for p in analysis["suspicious_patterns"]),
-                    "suspicious_patterns": analysis["suspicious_patterns"]
-                }
-            }
-            detected_leaks.append(leak_data)
-            self.leaks["external_shares"].append(leak_data)
-        
-        # 3. Подозрительная активность
-        if analysis["suspicious_patterns"]:
-            leak_data = {
-                "type": "suspicious_activity",
-                "chat_id": chat_id,
-                "user_id": user_id,
-                "message_id": message_id,
-                "timestamp": datetime.now().isoformat(),
-                "confidence": 50,
-                "details": {
-                    "patterns": analysis["suspicious_patterns"],
-                    "is_reply_to_forward": analysis["reply_to_forward"],
-                    "is_forward_chain": analysis["forward_chain"]
-                }
-            }
-            detected_leaks.append(leak_data)
-            self.leaks["suspicious_activity"].append(leak_data)
-        
-        return detected_leaks
-
-storage = IntegratedStorage()
-
-# ========== REAL-TIME MONITOR ==========
-class RealTimeMonitor:
-    def __init__(self):
-        self.active = True
-        self.check_interval = 60  # секунд
-        
-    def check_chat_activity(self, chat_id: int):
-        """Проверить активность в чате"""
+    def process_webhook(self, update):
+        """Обработать вебхук от Telegram"""
         try:
-            # Получаем последние сообщения из чата
-            result = storage.telegram_api.get_chat_history(chat_id, limit=50)
-            
-            if result.get("ok"):
-                messages = result.get("result", {}).get("messages", [])
+            # Обработка сообщений
+            if 'message' in update:
+                message = update['message']
+                chat_id = message.get('chat', {}).get('id')
+                user_id = message.get('from', {}).get('id')
+                username = message.get('from', {}).get('username', '')
+                first_name = message.get('from', {}).get('first_name', '')
+                message_id = message.get('message_id')
+                text = message.get('text', '') or message.get('caption', '')
                 
-                for msg in messages[-20:]:  # Проверяем последние 20 сообщений
-                    # Проверяем, не обрабатывали ли уже это сообщение
-                    msg_hash = hashlib.md5(f"{chat_id}_{msg.get('id')}".encode()).hexdigest()
+                # Анализ сообщения
+                analysis = self.analyze_message(message)
+                
+                # Если это уведомление о скриншоте
+                if analysis['is_screenshot']:
+                    logger.info(f"Обнаружен скриншот от пользователя {user_id} в чате {chat_id}")
                     
-                    if msg_hash not in storage.message_hashes:
-                        # Анализируем сообщение
-                        analysis = storage.analyze_telegram_message(msg)
-                        leaks = storage.detect_leaks(msg, analysis)
-                        
-                        if leaks:
-                            print(f"🚨 Обнаружены утечки в чате {chat_id}: {len(leaks)}")
-                        
-                        # Сохраняем сообщение
-                        msg_data = {
-                            "chat_id": chat_id,
-                            "message_id": msg.get("id"),
-                            "user_id": msg.get("from_id", {}).get("user_id", 0),
-                            "text": msg.get("text", "") or msg.get("caption", ""),
-                            "timestamp": datetime.now().isoformat(),
-                            "is_forwarded": "forward_date" in msg,
-                            "has_media": any(key in msg for key in ["photo", "video", "document"]),
-                            "analysis": analysis,
-                            "leaks_detected": len(leaks) > 0
-                        }
-                        
-                        storage.messages.append(msg_data)
-                        storage.message_hashes.add(msg_hash)
-            
-            # Обновляем время последней проверки
-            if str(chat_id) in storage.chat_metadata:
-                storage.chat_metadata[str(chat_id)]["last_checked"] = datetime.now().isoformat()
+                    # Определяем, кто сделал скриншот
+                    screenshot_user = self.extract_screenshot_user(text, user_id)
+                    
+                    # Сохраняем в БД
+                    screenshot_id = self.db.add_screenshot_event(
+                        chat_id=chat_id,
+                        user_id=screenshot_user['user_id'],
+                        username=screenshot_user['username'],
+                        first_name=screenshot_user['first_name'],
+                        message_id=message_id,
+                        screenshot_type=analysis['details']['screenshot_pattern'],
+                        message_text=text[:500],
+                        forwarded_from=screenshot_user.get('original_user')
+                    )
+                    
+                    # Отправляем оповещение админам
+                    if screenshot_id:
+                        self.send_screenshot_alert(screenshot_user, chat_id, message_id, text)
                 
+                # Если это пересылка
+                elif analysis['is_forward']:
+                    logger.info(f"Обнаружена пересылка от пользователя {user_id}")
+                    
+                    forward_data = self.extract_forward_info(message)
+                    
+                    # Сохраняем в БД
+                    forward_id = self.db.add_forward_event(
+                        original_chat_id=forward_data['original_chat_id'],
+                        original_message_id=forward_data['original_message_id'],
+                        forwarded_chat_id=chat_id,
+                        forwarded_message_id=message_id,
+                        user_id=user_id,
+                        username=username,
+                        message_content=forward_data['message_content'],
+                        is_to_pm=analysis['is_to_pm']
+                    )
+                    
+                    # Отправляем оповещение админам
+                    if forward_id:
+                        self.send_forward_alert(user_id, username, forward_data, analysis['is_to_pm'])
+                
+                # Если чат не в мониторинге, добавляем его
+                if chat_id not in self.monitored_chats:
+                    self.add_chat_to_monitoring(chat_id)
+            
+            return True
+            
         except Exception as e:
-            print(f"Chat check error for {chat_id}: {e}")
+            logger.error(f"Error processing webhook: {e}")
+            return False
     
-    def start_monitoring(self):
-        """Запустить мониторинг чатов"""
-        print("🎯 Запуск REAL-TIME мониторинга...")
+    def extract_screenshot_user(self, text, sender_id):
+        """Извлечь информацию о пользователе, сделавшем скриншот"""
+        # Пытаемся извлечь из текста уведомления
+        user_info = {
+            'user_id': sender_id,
+            'username': '',
+            'first_name': '',
+            'original_user': None
+        }
         
-        import threading
-        def monitor_loop():
-            while self.active:
-                try:
-                    # Проверяем все мониторимые чаты
-                    for chat_id in list(storage.monitored_chats):
-                        self.check_chat_activity(chat_id)
-                    
-                    # Автосохранение
-                    if len(storage.messages) % 50 == 0:
-                        storage.save()
-                    
-                    time.sleep(self.check_interval)
-                    
-                except Exception as e:
-                    print(f"Monitor loop error: {e}")
-                    time.sleep(30)
+        # Паттерны для извлечения username
+        patterns = [
+            r'пользователь\s+@(\w+)',
+            r'user\s+@(\w+)',
+            r'@(\w+)\s+сделал',
+            r'@(\w+)\s+made'
+        ]
         
-        thread = threading.Thread(target=monitor_loop, daemon=True)
-        thread.start()
+        for pattern in patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                user_info['username'] = match.group(1)
+                break
+        
+        return user_info
+    
+    def extract_forward_info(self, message):
+        """Извлечь информацию о пересылке"""
+        forward_info = {
+            'original_chat_id': None,
+            'original_message_id': None,
+            'message_content': ''
+        }
+        
+        # Получаем оригинальное сообщение
+        if 'forward_from_chat' in message:
+            forward_info['original_chat_id'] = message['forward_from_chat'].get('id')
+            forward_info['original_message_id'] = message.get('forward_from_message_id')
+        
+        # Получаем контент сообщения
+        text = message.get('text', '') or message.get('caption', '')
+        forward_info['message_content'] = text[:200] + ('...' if len(text) > 200 else '')
+        
+        return forward_info
+    
+    def add_chat_to_monitoring(self, chat_id):
+        """Добавить чат в мониторинг"""
+        try:
+            chat_info = self.tg.get_chat(chat_id)
+            if chat_info.get('ok'):
+                chat_data = chat_info['result']
+                self.db.add_chat(
+                    chat_id=chat_id,
+                    title=chat_data.get('title', f'Chat {chat_id}'),
+                    username=chat_data.get('username'),
+                    chat_type=chat_data.get('type', 'unknown')
+                )
+                self.monitored_chats.add(chat_id)
+                logger.info(f"Добавлен чат в мониторинг: {chat_data.get('title', chat_id)}")
+        except Exception as e:
+            logger.error(f"Error adding chat to monitoring: {e}")
+    
+    def send_screenshot_alert(self, user_info, chat_id, message_id, screenshot_text):
+        """Отправить оповещение о скриншоте"""
+        alert_message = f"""
+🚨 <b>ОБНАРУЖЕН СКРИНШОТ</b>
 
-monitor = RealTimeMonitor()
+<b>Пользователь:</b> @{user_info['username'] or 'Неизвестно'}
+<b>ID пользователя:</b> {user_info['user_id']}
+<b>Чат ID:</b> {chat_id}
+<b>Сообщение ID:</b> {message_id}
+<b>Время обнаружения:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 
-# ========== FLASK APP ==========
+<b>Текст уведомления:</b>
+{screenshot_text[:300]}{'...' if len(screenshot_text) > 300 else ''}
+
+<i>Система автоматического мониторинга</i>
+"""
+        
+        for admin_id in self.allowed_ids:
+            self.tg.send_message(admin_id, alert_message)
+    
+    def send_forward_alert(self, user_id, username, forward_data, is_to_pm):
+        """Отправить оповещение о пересылке"""
+        destination = "личные сообщения" if is_to_pm else "другой чат"
+        
+        alert_message = f"""
+⚠️ <b>ОБНАРУЖЕНА ПЕРЕСЫЛКА</b>
+
+<b>Пользователь:</b> @{username or 'Неизвестно'}
+<b>ID пользователя:</b> {user_id}
+<b>Направление:</b> {destination}
+<b>Время:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+<b>Переслано из чата:</b> {forward_data['original_chat_id']}
+<b>Сообщение ID:</b> {forward_data['original_message_id']}
+
+<b>Содержимое:</b>
+{forward_data['message_content']}
+
+<i>Система автоматического мониторинга</i>
+"""
+        
+        for admin_id in self.allowed_ids:
+            self.tg.send_message(admin_id, alert_message)
+
+# ========== ИНИЦИАЛИЗАЦИЯ ==========
+monitor = ScreenshotMonitor(TELEGRAM_TOKEN, ALLOWED_IDS)
 app = Flask(__name__)
 
-def send_alert_to_allowed_users(alert_data: dict):
-    """Отправить оповещение всем разрешённым пользователям"""
-    for user_id in ALLOWED_IDS:
-        try:
-            alert_message = f"""
-🚨 <b>REAL-TIME DETECTION</b>
+# ========== WEBHOOK ENDPOINT ==========
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    """Основной вебхук для Telegram"""
+    try:
+        update = request.json
+        monitor.process_webhook(update)
+        return jsonify({"ok": True})
+    except Exception as e:
+        logger.error(f"Webhook error: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
 
-<b>Тип утечки:</b> {alert_data['type'].replace('_', ' ').upper()}
-<b>Чат:</b> {alert_data.get('chat_title', f"ID: {alert_data['chat_id']}")}
-<b>Пользователь:</b> {alert_data.get('username', 'Unknown')}
-<b>Уверенность:</b> {alert_data['confidence']}%
-<b>Время:</b> {datetime.now().strftime('%H:%M:%S')}
-
-<b>Детали:</b>
-"""
-            
-            for key, value in alert_data.get('details', {}).items():
-                if isinstance(value, bool):
-                    value = "✅" if value else "❌"
-                alert_message += f"├─ {key}: {value}\n"
-            
-            alert_message += f"\n<i>Сообщение ID: {alert_data['message_id']}</i>"
-            
-            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-            data = {
-                "chat_id": user_id,
-                "text": alert_message,
-                "parse_mode": "HTML"
-            }
-            
-            requests.post(url, json=data, timeout=10)
-            
-        except Exception as e:
-            print(f"Alert send error to {user_id}: {e}")
-
+# ========== СТАТИСТИКА ДЛЯ ВЕБ-ИНТЕРФЕЙСА ==========
 @app.route('/')
-def home():
-    stats = {
-        "monitored_chats": len(storage.monitored_chats),
-        "total_messages": len(storage.messages),
-        "total_leaks": storage.get_total_leaks(),
-        "forwarded_leaks": len(storage.leaks["forwarded_messages"]),
-        "external_shares": len(storage.leaks["external_shares"]),
-        "suspicious_activity": len(storage.leaks["suspicious_activity"]),
-        "last_update": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    }
-    
-    # Получаем информацию о мониторимых чатах
-    monitored_chats_info = []
-    for chat_id in list(storage.monitored_chats)[:10]:
-        chat_info = storage.chat_metadata.get(str(chat_id), {
-            "id": chat_id,
-            "title": f"Chat {chat_id}",
-            "last_checked": "Never"
-        })
-        monitored_chats_info.append(chat_info)
-    
-    # Последние утечки
-    recent_leaks = []
-    for leak_type, leaks in storage.leaks.items():
-        for leak in leaks[-5:]:
-            leak["leak_type"] = leak_type
-            recent_leaks.append(leak)
-    
-    recent_leaks.sort(key=lambda x: x.get("timestamp", ""), reverse=True)
-    
-    return render_template('index.html',
-                         stats=stats,
-                         allowed_ids=ALLOWED_IDS,
-                         monitored_chats=monitored_chats_info,
-                         recent_leaks=recent_leaks[:15])
+def index():
+    """Главная страница веб-интерфейса"""
+    return render_template('index.html')
 
 @app.route('/api/stats')
 def api_stats():
-    return jsonify({
-        "monitoring": {
-            "active_chats": len(storage.monitored_chats),
-            "total_messages": len(storage.messages),
-            "check_interval": monitor.check_interval
-        },
-        "leaks": {
-            "forwarded_messages": len(storage.leaks["forwarded_messages"]),
-            "external_shares": len(storage.leaks["external_shares"]),
-            "suspicious_activity": len(storage.leaks["suspicious_activity"]),
-            "total": storage.get_total_leaks()
-        },
-        "system": {
-            "telegram_api": "connected",
-            "real_time_monitor": "active",
-            "last_check": datetime.now().isoformat()
-        }
-    })
+    """API для получения статистики"""
+    stats = {
+        'total_screenshots': len(monitor.db.get_recent_screenshots(1000)),
+        'total_forwards': len(monitor.db.get_recent_forwards(1000)),
+        'monitored_chats': len(monitor.monitored_chats),
+        'suspicious_users': len(monitor.db.get_suspicious_users()),
+        'last_update': datetime.now().isoformat()
+    }
+    return jsonify(stats)
 
-@app.route('/api/chats')
-def api_chats():
-    chats_info = []
-    for chat_id in storage.monitored_chats:
-        chat_info = storage.chat_metadata.get(str(chat_id), {
-            "id": chat_id,
-            "title": f"Chat {chat_id}",
-            "monitored_since": "unknown"
-        })
-        
-        # Подсчитываем сообщения и утечки в чате
-        chat_messages = [m for m in storage.messages if m.get("chat_id") == chat_id]
-        chat_leaks = []
-        for leak_type, leaks in storage.leaks.items():
-            chat_leaks.extend([l for l in leaks if l.get("chat_id") == chat_id])
-        
-        chat_info["messages_count"] = len(chat_messages)
-        chat_info["leaks_count"] = len(chat_leaks)
-        chats_info.append(chat_info)
+@app.route('/api/recent_screenshots')
+def api_recent_screenshots():
+    """API для получения последних скриншотов"""
+    screenshots = monitor.db.get_recent_screenshots(50)
+    result = []
     
-    return jsonify({"chats": chats_info, "count": len(chats_info)})
+    for s in screenshots:
+        result.append({
+            'id': s[0],
+            'chat_id': s[1],
+            'user_id': s[2],
+            'username': s[3],
+            'first_name': s[4],
+            'message_id': s[5],
+            'screenshot_type': s[6],
+            'detected_at': s[7],
+            'message_text': s[8],
+            'forwarded_from': s[9]
+        })
+    
+    return jsonify({'screenshots': result})
 
-@app.route('/api/monitor/add/<int:chat_id>')
-def api_monitor_add(chat_id):
-    """Добавить чат в мониторинг"""
-    try:
-        # Получаем информацию о чате
-        result = storage.telegram_api.get_chat_info(chat_id)
-        
-        if result.get("ok"):
-            storage.add_monitored_chat(chat_id, result.get("result"))
-            storage.save()
-            
-            return jsonify({
-                "success": True,
-                "message": f"Chat {chat_id} added to monitoring",
-                "chat_info": result.get("result")
-            })
-        else:
-            return jsonify({"success": False, "error": "Cannot get chat info"})
-    except Exception as e:
-        return jsonify({"success": False, "error": str(e)})
+@app.route('/api/recent_forwards')
+def api_recent_forwards():
+    """API для получения последних пересылок"""
+    forwards = monitor.db.get_recent_forwards(50)
+    result = []
+    
+    for f in forwards:
+        result.append({
+            'id': f[0],
+            'original_chat_id': f[1],
+            'original_message_id': f[2],
+            'forwarded_chat_id': f[3],
+            'forwarded_message_id': f[4],
+            'user_id': f[5],
+            'username': f[6],
+            'forwarded_at': f[7],
+            'message_content': f[8],
+            'is_to_pm': bool(f[9])
+        })
+    
+    return jsonify({'forwards': result})
 
-@app.route('/api/monitor/remove/<int:chat_id>')
-def api_monitor_remove(chat_id):
-    """Убрать чат из мониторинга"""
-    if chat_id in storage.monitored_chats:
-        storage.monitored_chats.remove(chat_id)
-        storage.save()
-        return jsonify({"success": True, "message": f"Chat {chat_id} removed from monitoring"})
-    return jsonify({"success": False, "error": "Chat not monitored"})
-
-@app.route('/health')
-def health():
-    return jsonify({
-        "status": "ok",
-        "service": "telegram-integrated-leak-detector",
-        "telegram_api": "connected" if TELEGRAM_TOKEN else "disconnected",
-        "real_time_monitor": "active" if monitor.active else "inactive",
-        "monitored_chats": len(storage.monitored_chats),
-        "timestamp": datetime.now().isoformat()
-    })
-
+# ========== НАСТРОЙКА WEBHOOK ==========
 @app.route('/setup')
-def setup():
-    """Установить вебхук и запустить мониторинг"""
+def setup_webhook():
+    """Настроить вебхук"""
     try:
-        webhook_url = os.environ.get("RENDER_EXTERNAL_URL", "https://anti-peresilka.onrender.com")
-        webhook_url = f"{webhook_url}/webhook"
+        webhook_url = os.environ.get("WEBHOOK_URL", f"https://{request.host}/webhook")
         
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setWebhook"
         data = {
             "url": webhook_url,
             "max_connections": 100,
-            "allowed_updates": ["message", "edited_message", "chat_member"]
+            "allowed_updates": ["message", "edited_message"]
         }
         
         response = requests.post(url, json=data)
         result = response.json()
         
-        # Запускаем мониторинг в реальном времени
-        monitor.start_monitoring()
-        
         return jsonify({
-            "ok": result.get("ok", False),
-            "webhook": webhook_url,
-            "real_time_monitor": "started",
-            "message": "System fully integrated with Telegram API"
+            "success": result.get("ok", False),
+            "webhook_url": webhook_url,
+            "message": "Webhook configured successfully"
         })
     except Exception as e:
-        return jsonify({"error": str(e)})
+        return jsonify({"error": str(e)}), 500
 
-@app.route('/webhook', methods=['POST'])
-def webhook():
-    """Обработчик вебхука - ОСНОВНОЙ МЕХАНИЗМ"""
-    try:
-        data = request.json
-        if not data:
-            return jsonify({"ok": True})
-        
-        # 1. Добавление бота в чат
-        if "my_chat_member" in data:
-            chat_member = data["my_chat_member"]
-            chat = chat_member.get("chat", {})
-            chat_id = chat.get("id")
-            
-            if chat_id:
-                # Автоматически добавляем в мониторинг
-                storage.add_monitored_chat(chat_id, chat)
-                print(f"🤖 Бот добавлен в чат: {chat.get('title', chat_id)}")
-                
-                # Отправляем приветствие
-                welcome_msg = f"""
-🎯 <b>TELEGRAM INTEGRATED LEAK DETECTOR</b>
-
-Чат <b>{chat.get('title', chat_id)}</b> добавлен в систему мониторинга.
-
-<b>🔍 Что отслеживается:</b>
-• Пересланные сообщения
-• Внешние ссылки и файлообменники
-• Подозрительная активность
-• Кросс-чат пересылки
-
-<b>👁️ Режим:</b> REAL-TIME мониторинг
-<b>⏱️ Интервал проверки:</b> {monitor.check_interval} секунд
-
-<i>Система работает в фоновом режиме</i>
-"""
-                
-                for user_id in ALLOWED_IDS:
-                    try:
-                        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-                        requests.post(url, json={
-                            "chat_id": user_id,
-                            "text": welcome_msg,
-                            "parse_mode": "HTML"
-                        })
-                    except:
-                        pass
-        
-        # 2. Обработка сообщений
-        if "message" in data:
-            message = data["message"]
-            chat_id = message.get("chat", {}).get("id")
-            user_id = message.get("from", {}).get("id")
-            
-            # Автоматически добавляем чат в мониторинг
-            if chat_id and chat_id not in storage.monitored_chats:
-                storage.add_monitored_chat(chat_id, message.get("chat", {}))
-            
-            # Анализируем сообщение
-            analysis = storage.analyze_telegram_message(message)
-            leaks = storage.detect_leaks(message, analysis)
-            
-            # Сохраняем сообщение
-            msg_hash = storage._get_message_hash({
-                "chat_id": chat_id,
-                "message_id": message.get("message_id"),
-                "text": message.get("text", "") or message.get("caption", "")
-            })
-            
-            if msg_hash not in storage.message_hashes:
-                msg_data = {
-                    "chat_id": chat_id,
-                    "message_id": message.get("message_id"),
-                    "user_id": user_id,
-                    "text": message.get("text", "") or message.get("caption", "")[:500],
-                    "timestamp": datetime.now().isoformat(),
-                    "analysis": analysis,
-                    "leaks_detected": len(leaks) > 0
-                }
-                
-                storage.messages.append(msg_data)
-                storage.message_hashes.add(msg_hash)
-            
-            # Если обнаружены утечки - отправляем оповещение
-            if leaks:
-                for leak in leaks:
-                    # Получаем информацию о пользователе
-                    user_info = storage.users.get(user_id, {})
-                    if not user_info:
-                        storage.users[user_id] = {
-                            "id": user_id,
-                            "username": message.get("from", {}).get("username", ""),
-                            "first_name": message.get("from", {}).get("first_name", ""),
-                            "leaks_count": 0,
-                            "first_seen": datetime.now().isoformat()
-                        }
-                        user_info = storage.users[user_id]
-                    
-                    user_info["leaks_count"] = user_info.get("leaks_count", 0) + 1
-                    user_info["last_seen"] = datetime.now().isoformat()
-                    
-                    # Формируем данные для оповещения
-                    alert_data = {
-                        "type": leak["type"],
-                        "chat_id": chat_id,
-                        "chat_title": message.get("chat", {}).get("title", f"Chat {chat_id}"),
-                        "user_id": user_id,
-                        "username": user_info.get("username", ""),
-                        "message_id": message.get("message_id"),
-                        "confidence": leak["confidence"],
-                        "details": leak["details"],
-                        "timestamp": leak["timestamp"]
-                    }
-                    
-                    # Отправляем оповещение
-                    send_alert_to_allowed_users(alert_data)
-                    
-                    print(f"🚨 Real-time leak detected: {leak['type']} in chat {chat_id}")
-            
-            # Обработка команд от разрешённых пользователей
-            if user_id in ALLOWED_IDS:
-                text = message.get("text", "").lower()
-                
-                if text.startswith("/monitor"):
-                    # Команда для управления мониторингом
-                    parts = text.split()
-                    if len(parts) > 1:
-                        if parts[1] == "list":
-                            # Показать список мониторимых чатов
-                            response_msg = "📋 <b>Мониторимые чаты:</b>\n\n"
-                            for chat_id in list(storage.monitored_chats)[:10]:
-                                chat_info = storage.chat_metadata.get(str(chat_id), {})
-                                response_msg += f"• {chat_info.get('title', f'Chat {chat_id}')}\n"
-                            
-                            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-                            requests.post(url, json={
-                                "chat_id": chat_id,
-                                "text": response_msg,
-                                "parse_mode": "HTML"
-                            })
-                
-                elif text.startswith("/stats"):
-                    # Статистика
-                    stats_msg = f"""
-📊 <b>REAL-TIME STATS</b>
-
-<b>Мониторинг:</b>
-• Чатов: {len(storage.monitored_chats)}
-• Сообщений: {len(storage.messages)}
-• Проверок: {len(storage.message_hashes)}
-
-<b>Утечки:</b>
-• Пересланные: {len(storage.leaks['forwarded_messages'])}
-• Внешние ссылки: {len(storage.leaks['external_shares'])}
-• Подозрительные: {len(storage.leaks['suspicious_activity'])}
-• Всего: {storage.get_total_leaks()}
-
-<b>Система:</b>
-• Режим: REAL-TIME
-• Интервал: {monitor.check_interval} сек
-• API: Connected
-"""
-                    
-                    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-                    requests.post(url, json={
-                        "chat_id": chat_id,
-                        "text": stats_msg,
-                        "parse_mode": "HTML"
-                    })
-        
-        # Автосохранение
-        if len(storage.messages) % 25 == 0:
-            storage.save()
-        
-        return jsonify({"ok": True, "processed": True})
-        
-    except Exception as e:
-        print(f"Webhook error: {e}")
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-# Автосохранение
-def auto_save():
-    while True:
-        time.sleep(180)
-        storage.save()
-
-import threading
-save_thread = threading.Thread(target=auto_save, daemon=True)
-save_thread.start()
-
-# ========== ЗАПУСК ==========
+# ========== ЗАПУСК СЕРВЕРА ==========
 if __name__ == "__main__":
-    print("🚀 Запуск ИНТЕГРИРОВАННОГО ТЕЛЕГРАМ БОТА...")
-    print(f"✅ Telegram API: Подключено")
-    print(f"✅ Real-Time мониторинг: Готов")
-    print(f"✅ Разрешённые пользователи: {len(ALLOWED_IDS)}")
-    print("="*70)
-    print("⚡ Система работает как ЕДИНОЕ ЦЕЛОЕ с Telegram")
-    print("🔍 Обнаружение РЕАЛЬНЫХ сливов, а не текста")
-    print("="*70)
+    logger.info(f"🚀 Запуск Screenshot Monitor v2.0")
+    logger.info(f"✅ Разрешённые пользователи: {len(ALLOWED_IDS)}")
+    logger.info(f"✅ Мониторинг чатов: {len(monitor.monitored_chats)}")
+    logger.info(f"🌐 Webhook порт: {PORT}")
     
     app.run(host="0.0.0.0", port=PORT, debug=False)
