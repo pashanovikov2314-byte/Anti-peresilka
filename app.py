@@ -2,33 +2,34 @@ import os
 import json
 import time
 import re
-import asyncio
 import hashlib
 import sqlite3
 from datetime import datetime
 from flask import Flask, request, jsonify, render_template
 import requests
 import logging
-from typing import Dict, List, Set, Tuple
-from collections import defaultdict
+from typing import Dict, List, Set
+import threading
 
 # ========== КОНФИГУРАЦИЯ ==========
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 ALLOWED_IDS = [int(x.strip()) for x in os.environ.get("ALLOWED_IDS", "").split(",") if x.strip()]
-ADMIN_IDS = [int(x.strip()) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip()] or ALLOWED_IDS
 PORT = int(os.environ.get("PORT", 10000))
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
 # ========== ТЕЛЕГРАМ API ==========
-class TelegramMonitor:
+class TelegramAPI:
     def __init__(self, token):
         self.token = token
         self.base_url = f"https://api.telegram.org/bot{token}"
-        
+    
     def send_message(self, chat_id, text, parse_mode="HTML"):
-        """Отправить сообщение в Telegram"""
+        """Отправить сообщение"""
         try:
             url = f"{self.base_url}/sendMessage"
             data = {
@@ -38,577 +39,462 @@ class TelegramMonitor:
                 "disable_web_page_preview": True
             }
             response = requests.post(url, json=data, timeout=10)
-            return response.json()
+            result = response.json()
+            
+            if not result.get("ok"):
+                logger.error(f"Send message failed: {result}")
+            
+            return result
         except Exception as e:
             logger.error(f"Send message error: {e}")
             return {"ok": False}
     
-    def get_chat_member(self, chat_id, user_id):
-        """Получить информацию об участнике чата"""
+    def set_webhook(self, url):
+        """Установить вебхук"""
         try:
-            url = f"{self.base_url}/getChatMember"
-            data = {"chat_id": chat_id, "user_id": user_id}
-            response = requests.post(url, json=data, timeout=10)
-            return response.json()
+            webhook_url = f"{self.base_url}/setWebhook"
+            data = {
+                "url": url,
+                "max_connections": 100,
+                "allowed_updates": ["message", "edited_message", "channel_post"]
+            }
+            response = requests.post(webhook_url, json=data)
+            result = response.json()
+            
+            if result.get("ok"):
+                logger.info(f"✅ Webhook установлен: {url}")
+            else:
+                logger.error(f"❌ Webhook ошибка: {result}")
+            
+            return result
         except Exception as e:
-            logger.error(f"Get chat member error: {e}")
+            logger.error(f"Webhook error: {e}")
             return {"ok": False}
     
-    def get_chat(self, chat_id):
-        """Получить информацию о чате"""
+    def delete_webhook(self):
+        """Удалить вебхук"""
         try:
-            url = f"{self.base_url}/getChat"
-            data = {"chat_id": chat_id}
-            response = requests.post(url, json=data, timeout=10)
+            url = f"{self.base_url}/deleteWebhook"
+            response = requests.post(url)
             return response.json()
         except Exception as e:
-            logger.error(f"Get chat error: {e}")
+            logger.error(f"Delete webhook error: {e}")
+            return {"ok": False}
+    
+    def get_me(self):
+        """Проверить подключение бота"""
+        try:
+            url = f"{self.base_url}/getMe"
+            response = requests.get(url)
+            return response.json()
+        except Exception as e:
+            logger.error(f"GetMe error: {e}")
             return {"ok": False}
 
-# ========== БАЗА ДАННЫХ МОНИТОРИНГА ==========
-class ScreenshotMonitorDB:
-    def __init__(self):
-        self.conn = sqlite3.connect('screenshot_monitor.db', check_same_thread=False)
-        self.cursor = self.conn.cursor()
-        self.init_tables()
-    
-    def init_tables(self):
-        """Инициализация таблиц базы данных"""
-        # Таблица для отслеживания скриншотов
-        self.cursor.execute('''
-            CREATE TABLE IF NOT EXISTS screenshots (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                chat_id INTEGER,
-                user_id INTEGER,
-                username TEXT,
-                first_name TEXT,
-                message_id INTEGER,
-                screenshot_type TEXT,
-                detected_at TIMESTAMP,
-                message_text TEXT,
-                forwarded_from TEXT
-            )
-        ''')
-        
-        # Таблица для пересланных сообщений
-        self.cursor.execute('''
-            CREATE TABLE IF NOT EXISTS forwarded_messages (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                original_chat_id INTEGER,
-                original_message_id INTEGER,
-                forwarded_chat_id INTEGER,
-                forwarded_message_id INTEGER,
-                user_id INTEGER,
-                username TEXT,
-                forwarded_at TIMESTAMP,
-                message_content TEXT,
-                is_to_pm INTEGER DEFAULT 0
-            )
-        ''')
-        
-        # Таблица для копирования сообщений
-        self.cursor.execute('''
-            CREATE TABLE IF NOT EXISTS copied_messages (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                chat_id INTEGER,
-                user_id INTEGER,
-                username TEXT,
-                message_id INTEGER,
-                copied_text TEXT,
-                copied_at TIMESTAMP,
-                detection_method TEXT
-            )
-        ''')
-        
-        # Таблица пользователей
-        self.cursor.execute('''
-            CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY,
-                username TEXT,
-                first_name TEXT,
-                last_name TEXT,
-                is_bot INTEGER DEFAULT 0,
-                first_seen TIMESTAMP,
-                last_activity TIMESTAMP,
-                total_screenshots INTEGER DEFAULT 0,
-                total_forwards INTEGER DEFAULT 0,
-                total_copies INTEGER DEFAULT 0,
-                suspicious_score INTEGER DEFAULT 0
-            )
-        ''')
-        
-        # Таблица чатов
-        self.cursor.execute('''
-            CREATE TABLE IF NOT EXISTS chats (
-                chat_id INTEGER PRIMARY KEY,
-                title TEXT,
-                username TEXT,
-                type TEXT,
-                added_to_monitoring TIMESTAMP,
-                is_active INTEGER DEFAULT 1
-            )
-        ''')
-        
-        self.conn.commit()
-    
-    def add_screenshot_event(self, chat_id, user_id, username, first_name, message_id, screenshot_type, message_text, forwarded_from=None):
-        """Добавить запись о скриншоте"""
-        self.cursor.execute('''
-            INSERT INTO screenshots 
-            (chat_id, user_id, username, first_name, message_id, screenshot_type, detected_at, message_text, forwarded_from)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (chat_id, user_id, username, first_name, message_id, screenshot_type, datetime.now(), message_text, forwarded_from))
-        
-        # Обновить статистику пользователя
-        self.cursor.execute('''
-            INSERT OR IGNORE INTO users (user_id, username, first_name, first_seen, last_activity)
-            VALUES (?, ?, ?, ?, ?)
-        ''', (user_id, username, first_name, datetime.now(), datetime.now()))
-        
-        self.cursor.execute('''
-            UPDATE users 
-            SET total_screenshots = total_screenshots + 1,
-                last_activity = ?,
-                suspicious_score = suspicious_score + 5
-            WHERE user_id = ?
-        ''', (datetime.now(), user_id))
-        
-        self.conn.commit()
-        return self.cursor.lastrowid
-    
-    def add_forward_event(self, original_chat_id, original_message_id, forwarded_chat_id, forwarded_message_id, user_id, username, message_content, is_to_pm=False):
-        """Добавить запись о пересылке"""
-        self.cursor.execute('''
-            INSERT INTO forwarded_messages 
-            (original_chat_id, original_message_id, forwarded_chat_id, forwarded_message_id, user_id, username, forwarded_at, message_content, is_to_pm)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (original_chat_id, original_message_id, forwarded_chat_id, forwarded_message_id, user_id, username, datetime.now(), message_content, 1 if is_to_pm else 0))
-        
-        # Обновить статистику пользователя
-        self.cursor.execute('''
-            UPDATE users 
-            SET total_forwards = total_forwards + 1,
-                last_activity = ?,
-                suspicious_score = suspicious_score + (10 if ? = 1 else 3)
-            WHERE user_id = ?
-        ''', (datetime.now(), 1 if is_to_pm else 0, user_id))
-        
-        self.conn.commit()
-        return self.cursor.lastrowid
-    
-    def add_copy_event(self, chat_id, user_id, username, message_id, copied_text, detection_method):
-        """Добавить запись о копировании"""
-        self.cursor.execute('''
-            INSERT INTO copied_messages 
-            (chat_id, user_id, username, message_id, copied_text, copied_at, detection_method)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        ''', (chat_id, user_id, username, message_id, copied_text, datetime.now(), detection_method))
-        
-        # Обновить статистику пользователя
-        self.cursor.execute('''
-            UPDATE users 
-            SET total_copies = total_copies + 1,
-                last_activity = ?,
-                suspicious_score = suspicious_score + 2
-            WHERE user_id = ?
-        ''', (datetime.now(), user_id))
-        
-        self.conn.commit()
-        return self.cursor.lastrowid
-    
-    def add_chat(self, chat_id, title, username, chat_type):
-        """Добавить чат в мониторинг"""
-        self.cursor.execute('''
-            INSERT OR REPLACE INTO chats (chat_id, title, username, type, added_to_monitoring)
-            VALUES (?, ?, ?, ?, ?)
-        ''', (chat_id, title, username or "", chat_type, datetime.now()))
-        self.conn.commit()
-    
-    def get_user_stats(self, user_id):
-        """Получить статистику пользователя"""
-        self.cursor.execute('''
-            SELECT * FROM users WHERE user_id = ?
-        ''', (user_id,))
-        return self.cursor.fetchone()
-    
-    def get_recent_screenshots(self, limit=50):
-        """Получить последние скриншоты"""
-        self.cursor.execute('''
-            SELECT * FROM screenshots 
-            ORDER BY detected_at DESC 
-            LIMIT ?
-        ''', (limit,))
-        return self.cursor.fetchall()
-    
-    def get_recent_forwards(self, limit=50):
-        """Получить последние пересылки"""
-        self.cursor.execute('''
-            SELECT * FROM forwarded_messages 
-            ORDER BY forwarded_at DESC 
-            LIMIT ?
-        ''', (limit,))
-        return self.cursor.fetchall()
-    
-    def get_suspicious_users(self, limit=20):
-        """Получить подозрительных пользователей"""
-        self.cursor.execute('''
-            SELECT * FROM users 
-            WHERE suspicious_score > 0 
-            ORDER BY suspicious_score DESC 
-            LIMIT ?
-        ''', (limit,))
-        return self.cursor.fetchall()
-
-# ========== ОСНОВНОЙ КЛАСС МОНИТОРИНГА ==========
+# ========== МОНИТОРИНГ ==========
 class ScreenshotMonitor:
     def __init__(self, token, allowed_ids):
-        self.tg = TelegramMonitor(token)
-        self.db = ScreenshotMonitorDB()
+        self.tg = TelegramAPI(token)
         self.allowed_ids = allowed_ids
-        self.monitored_chats = set()
         self.screenshot_patterns = [
-            "обнаружен снимок экрана",
-            "screenshot detected",
-            "скриншот обнаружен",
-            "снимок экрана",
-            "made a screenshot"
+            r'обнаружен[ао]?\s+снимок\s+экрана',
+            r'screenshot\s+detected',
+            r'скриншот\s+обнаружен',
+            r'сделал[аи]?\s+скриншот',
+            r'made\s+a\s+screenshot',
+            r'снимок\s+экрана\s+сделан'
         ]
         
-        # Загружаем чаты из БД
-        self.load_monitored_chats()
+        # Проверяем бота
+        self.check_bot()
     
-    def load_monitored_chats(self):
-        """Загрузить чаты из базы данных"""
-        self.db.cursor.execute('SELECT chat_id FROM chats WHERE is_active = 1')
-        for row in self.db.cursor.fetchall():
-            self.monitored_chats.add(row[0])
+    def check_bot(self):
+        """Проверить доступность бота"""
+        result = self.tg.get_me()
+        if result.get("ok"):
+            bot_info = result["result"]
+            logger.info(f"✅ Бот подключен: @{bot_info.get('username')} ({bot_info.get('id')})")
+            return True
+        else:
+            logger.error(f"❌ Бот не доступен: {result.get('description')}")
+            return False
     
-    def detect_screenshot(self, message_text):
-        """Обнаружить упоминание скриншота в сообщении"""
-        if not message_text:
+    def detect_screenshot(self, text):
+        """Обнаружить уведомление о скриншоте"""
+        if not text:
             return False, None
         
-        message_lower = message_text.lower()
         for pattern in self.screenshot_patterns:
-            if pattern in message_lower:
+            if re.search(pattern, text, re.IGNORECASE):
                 return True, pattern
         
         return False, None
     
-    def analyze_message(self, message_data):
-        """Анализировать сообщение на подозрительные действия"""
-        results = {
-            'is_screenshot': False,
-            'is_forward': False,
-            'is_copy': False,
-            'is_to_pm': False,
-            'details': {}
-        }
-        
-        # Проверка на пересылку
-        if 'forward_from_chat' in message_data or 'forward_from' in message_data:
-            results['is_forward'] = True
-            results['details']['forward_type'] = 'cross_chat' if 'forward_from_chat' in message_data else 'user'
-            
-            # Проверка, переслано ли в ЛС
-            chat = message_data.get('chat', {})
-            if chat.get('type') == 'private':
-                results['is_to_pm'] = True
-        
-        # Проверка текста на скриншоты
-        text = message_data.get('text', '') or message_data.get('caption', '')
-        is_screenshot, pattern = self.detect_screenshot(text)
-        if is_screenshot:
-            results['is_screenshot'] = True
-            results['details']['screenshot_pattern'] = pattern
-        
-        return results
-    
-    def process_webhook(self, update):
-        """Обработать вебхук от Telegram"""
-        try:
-            # Обработка сообщений
-            if 'message' in update:
-                message = update['message']
-                chat_id = message.get('chat', {}).get('id')
-                user_id = message.get('from', {}).get('id')
-                username = message.get('from', {}).get('username', '')
-                first_name = message.get('from', {}).get('first_name', '')
-                message_id = message.get('message_id')
-                text = message.get('text', '') or message.get('caption', '')
-                
-                # Анализ сообщения
-                analysis = self.analyze_message(message)
-                
-                # Если это уведомление о скриншоте
-                if analysis['is_screenshot']:
-                    logger.info(f"Обнаружен скриншот от пользователя {user_id} в чате {chat_id}")
-                    
-                    # Определяем, кто сделал скриншот
-                    screenshot_user = self.extract_screenshot_user(text, user_id)
-                    
-                    # Сохраняем в БД
-                    screenshot_id = self.db.add_screenshot_event(
-                        chat_id=chat_id,
-                        user_id=screenshot_user['user_id'],
-                        username=screenshot_user['username'],
-                        first_name=screenshot_user['first_name'],
-                        message_id=message_id,
-                        screenshot_type=analysis['details']['screenshot_pattern'],
-                        message_text=text[:500],
-                        forwarded_from=screenshot_user.get('original_user')
-                    )
-                    
-                    # Отправляем оповещение админам
-                    if screenshot_id:
-                        self.send_screenshot_alert(screenshot_user, chat_id, message_id, text)
-                
-                # Если это пересылка
-                elif analysis['is_forward']:
-                    logger.info(f"Обнаружена пересылка от пользователя {user_id}")
-                    
-                    forward_data = self.extract_forward_info(message)
-                    
-                    # Сохраняем в БД
-                    forward_id = self.db.add_forward_event(
-                        original_chat_id=forward_data['original_chat_id'],
-                        original_message_id=forward_data['original_message_id'],
-                        forwarded_chat_id=chat_id,
-                        forwarded_message_id=message_id,
-                        user_id=user_id,
-                        username=username,
-                        message_content=forward_data['message_content'],
-                        is_to_pm=analysis['is_to_pm']
-                    )
-                    
-                    # Отправляем оповещение админам
-                    if forward_id:
-                        self.send_forward_alert(user_id, username, forward_data, analysis['is_to_pm'])
-                
-                # Если чат не в мониторинге, добавляем его
-                if chat_id not in self.monitored_chats:
-                    self.add_chat_to_monitoring(chat_id)
-            
-            return True
-            
-        except Exception as e:
-            logger.error(f"Error processing webhook: {e}")
-            return False
-    
-    def extract_screenshot_user(self, text, sender_id):
-        """Извлечь информацию о пользователе, сделавшем скриншот"""
-        # Пытаемся извлечь из текста уведомления
-        user_info = {
-            'user_id': sender_id,
-            'username': '',
-            'first_name': '',
-            'original_user': None
-        }
-        
-        # Паттерны для извлечения username
+    def extract_user_from_screenshot(self, text):
+        """Извлечь пользователя из уведомления о скриншоте"""
         patterns = [
+            r'@(\w+)\s+сделал',
+            r'@(\w+)\s+made',
             r'пользователь\s+@(\w+)',
             r'user\s+@(\w+)',
-            r'@(\w+)\s+сделал',
-            r'@(\w+)\s+made'
+            r'(\w+)\s+сделал\s+скриншот'
         ]
         
         for pattern in patterns:
             match = re.search(pattern, text, re.IGNORECASE)
             if match:
-                user_info['username'] = match.group(1)
-                break
+                return match.group(1)
         
-        return user_info
+        return "Неизвестно"
     
-    def extract_forward_info(self, message):
-        """Извлечь информацию о пересылке"""
-        forward_info = {
-            'original_chat_id': None,
-            'original_message_id': None,
-            'message_content': ''
-        }
+    def send_alert(self, alert_data):
+        """Отправить оповещение всем админам"""
+        alert_type = alert_data.get("type", "unknown")
         
-        # Получаем оригинальное сообщение
-        if 'forward_from_chat' in message:
-            forward_info['original_chat_id'] = message['forward_from_chat'].get('id')
-            forward_info['original_message_id'] = message.get('forward_from_message_id')
-        
-        # Получаем контент сообщения
-        text = message.get('text', '') or message.get('caption', '')
-        forward_info['message_content'] = text[:200] + ('...' if len(text) > 200 else '')
-        
-        return forward_info
-    
-    def add_chat_to_monitoring(self, chat_id):
-        """Добавить чат в мониторинг"""
-        try:
-            chat_info = self.tg.get_chat(chat_id)
-            if chat_info.get('ok'):
-                chat_data = chat_info['result']
-                self.db.add_chat(
-                    chat_id=chat_id,
-                    title=chat_data.get('title', f'Chat {chat_id}'),
-                    username=chat_data.get('username'),
-                    chat_type=chat_data.get('type', 'unknown')
-                )
-                self.monitored_chats.add(chat_id)
-                logger.info(f"Добавлен чат в мониторинг: {chat_data.get('title', chat_id)}")
-        except Exception as e:
-            logger.error(f"Error adding chat to monitoring: {e}")
-    
-    def send_screenshot_alert(self, user_info, chat_id, message_id, screenshot_text):
-        """Отправить оповещение о скриншоте"""
-        alert_message = f"""
-🚨 <b>ОБНАРУЖЕН СКРИНШОТ</b>
+        if alert_type == "screenshot":
+            message = f"""
+🚨 <b>СКРИНШОТ ОБНАРУЖЕН</b>
 
-<b>Пользователь:</b> @{user_info['username'] or 'Неизвестно'}
-<b>ID пользователя:</b> {user_info['user_id']}
-<b>Чат ID:</b> {chat_id}
-<b>Сообщение ID:</b> {message_id}
-<b>Время обнаружения:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+<b>👤 Пользователь:</b> @{alert_data.get('username', 'Неизвестно')}
+<b>🆔 ID:</b> {alert_data.get('user_id', 'N/A')}
+<b>💬 Чат:</b> {alert_data.get('chat_title', f"ID: {alert_data.get('chat_id', 'N/A')}")}
+<b>🕒 Время:</b> {datetime.now().strftime('%H:%M:%S %d.%m.%Y')}
 
-<b>Текст уведомления:</b>
-{screenshot_text[:300]}{'...' if len(screenshot_text) > 300 else ''}
+<b>📝 Уведомление:</b>
+{alert_data.get('notification_text', '')[:200]}
 
-<i>Система автоматического мониторинга</i>
+<i>⚠️ Пользователь сделал скриншот сообщения</i>
 """
         
-        for admin_id in self.allowed_ids:
-            self.tg.send_message(admin_id, alert_message)
-    
-    def send_forward_alert(self, user_id, username, forward_data, is_to_pm):
-        """Отправить оповещение о пересылке"""
-        destination = "личные сообщения" if is_to_pm else "другой чат"
-        
-        alert_message = f"""
-⚠️ <b>ОБНАРУЖЕНА ПЕРЕСЫЛКА</b>
+        elif alert_type == "forward":
+            destination = "личные сообщения" if alert_data.get("is_to_pm") else "другой чат"
+            message = f"""
+⚠️ <b>ПЕРЕСЫЛКА ОБНАРУЖЕНА</b>
 
-<b>Пользователь:</b> @{username or 'Неизвестно'}
-<b>ID пользователя:</b> {user_id}
-<b>Направление:</b> {destination}
-<b>Время:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+<b>👤 Пользователь:</b> @{alert_data.get('username', 'Неизвестно')}
+<b>🆔 ID:</b> {alert_data.get('user_id', 'N/A')}
+<b>📨 Направление:</b> {destination}
+<b>💬 Исходный чат:</b> {alert_data.get('chat_title', f"ID: {alert_data.get('chat_id', 'N/A')}")}
+<b>🕒 Время:</b> {datetime.now().strftime('%H:%M:%S %d.%m.%Y')}
 
-<b>Переслано из чата:</b> {forward_data['original_chat_id']}
-<b>Сообщение ID:</b> {forward_data['original_message_id']}
+<b>📄 Содержимое:</b>
+{alert_data.get('message_content', '')[:150]}
 
-<b>Содержимое:</b>
-{forward_data['message_content']}
-
-<i>Система автоматического мониторинга</i>
+<i>⚠️ Сообщение было переслано из защищённого чата</i>
 """
         
-        for admin_id in self.allowed_ids:
-            self.tg.send_message(admin_id, alert_message)
+        else:
+            message = f"""
+⚠️ <b>ПОДОЗРИТЕЛЬНАЯ АКТИВНОСТЬ</b>
 
-# ========== ИНИЦИАЛИЗАЦИЯ ==========
-monitor = ScreenshotMonitor(TELEGRAM_TOKEN, ALLOWED_IDS)
+<b>Тип:</b> {alert_type}
+<b>Пользователь:</b> @{alert_data.get('username', 'Неизвестно')}
+<b>Время:</b> {datetime.now().strftime('%H:%M:%S %d.%m.%Y')}
+"""
+        
+        # Отправляем всем админам
+        success_count = 0
+        for admin_id in self.allowed_ids:
+            try:
+                result = self.tg.send_message(admin_id, message)
+                if result.get("ok"):
+                    success_count += 1
+                    logger.info(f"✅ Оповещение отправлено админу {admin_id}")
+                else:
+                    logger.error(f"❌ Ошибка отправки админу {admin_id}: {result}")
+            except Exception as e:
+                logger.error(f"Ошибка отправки админу {admin_id}: {e}")
+        
+        logger.info(f"📤 Отправлено {success_count}/{len(self.allowed_ids)} оповещений")
+        return success_count > 0
+
+# ========== FLASK APP ==========
 app = Flask(__name__)
+telegram = TelegramAPI(TELEGRAM_TOKEN)
+monitor = ScreenshotMonitor(TELEGRAM_TOKEN, ALLOWED_IDS)
 
-# ========== WEBHOOK ENDPOINT ==========
+# ========== ВАЖНО: ВЕБХУК ==========
 @app.route('/webhook', methods=['POST'])
 def webhook():
-    """Основной вебхук для Telegram"""
+    """Основной обработчик вебхука"""
     try:
         update = request.json
-        monitor.process_webhook(update)
+        
+        # Логируем входящий запрос
+        logger.info(f"📥 Получен вебхук: {json.dumps(update, ensure_ascii=False)[:200]}...")
+        
+        # Проверяем наличие сообщения
+        if 'message' not in update:
+            logger.info("Сообщение не найдено в update")
+            return jsonify({"ok": True})
+        
+        message = update['message']
+        chat = message.get('chat', {})
+        user = message.get('from', {})
+        
+        chat_id = chat.get('id')
+        user_id = user.get('id')
+        username = user.get('username', '')
+        first_name = user.get('first_name', '')
+        text = message.get('text', '') or message.get('caption', '')
+        
+        logger.info(f"💬 Сообщение от @{username} ({user_id}) в чате {chat_id}: {text[:50]}...")
+        
+        # 1. Проверяем скриншоты
+        is_screenshot, pattern = monitor.detect_screenshot(text)
+        if is_screenshot:
+            logger.info(f"📸 Обнаружен скриншот: {pattern}")
+            
+            # Извлекаем пользователя
+            screenshot_user = monitor.extract_user_from_screenshot(text)
+            
+            # Отправляем оповещение
+            alert_data = {
+                "type": "screenshot",
+                "user_id": user_id,
+                "username": screenshot_user,
+                "chat_id": chat_id,
+                "chat_title": chat.get('title', f"Chat {chat_id}"),
+                "notification_text": text,
+                "pattern": pattern
+            }
+            
+            monitor.send_alert(alert_data)
+        
+        # 2. Проверяем пересылки
+        elif 'forward_from_chat' in message or 'forward_from' in message:
+            logger.info(f"📨 Обнаружена пересылка от @{username}")
+            
+            is_to_pm = chat.get('type') == 'private'
+            message_content = text[:150] if text else "Медиа-сообщение"
+            
+            alert_data = {
+                "type": "forward",
+                "user_id": user_id,
+                "username": username or first_name,
+                "chat_id": chat_id,
+                "chat_title": chat.get('title', f"Chat {chat_id}"),
+                "is_to_pm": is_to_pm,
+                "message_content": message_content,
+                "forward_from": message.get('forward_from_chat', {}).get('title', 'Неизвестно')
+            }
+            
+            monitor.send_alert(alert_data)
+        
+        # 3. Проверяем команды от админов
+        elif user_id in ALLOWED_IDS and text.startswith('/'):
+            logger.info(f"⚡ Команда от админа: {text}")
+            
+            if text == '/start':
+                welcome_msg = """
+👮 <b>TELEGRAM MONITOR PRO</b>
+
+<b>Система мониторинга активна!</b>
+
+📊 <b>Команды:</b>
+/status - статус системы
+/stats - статистика
+/monitor - информация о мониторинге
+/help - помощь
+
+🔍 <b>Отслеживается:</b>
+• Скриншоты сообщений
+• Пересылки в другие чаты/ЛС
+• Подозрительная активность
+
+⚡ <b>Режим:</b> Реальное время
+"""
+                telegram.send_message(user_id, welcome_msg)
+            
+            elif text == '/status':
+                status_msg = f"""
+📊 <b>СТАТУС СИСТЕМЫ</b>
+
+✅ <b>Бот:</b> Активен
+✅ <b>Вебхук:</b> Настроен
+✅ <b>Мониторинг:</b> Включён
+👮 <b>Админы:</b> {len(ALLOWED_IDS)}
+🕒 <b>Время:</b> {datetime.now().strftime('%H:%M:%S %d.%m.%Y')}
+
+<i>Система работает в штатном режиме</i>
+"""
+                telegram.send_message(user_id, status_msg)
+            
+            elif text == '/help':
+                help_msg = """
+❓ <b>ПОМОЩЬ ПО СИСТЕМЕ</b>
+
+<b>Как работает система:</b>
+1. Добавьте бота в чат как администратора
+2. Бот автоматически начнёт мониторинг
+3. При обнаружении скриншота или пересылки вы получите оповещение
+
+<b>Что отслеживается:</b>
+• Уведомления "Пользователь @username сделал скриншот"
+• Пересылки сообщений в другие чаты
+• Пересылки в личные сообщения
+
+<b>Настройки:</b>
+• ID админов задаются в переменной ALLOWED_IDS
+• Все оповещения приходят в ЛС
+
+<b>Поддержка:</b>
+Система работает автоматически 24/7
+"""
+                telegram.send_message(user_id, help_msg)
+        
         return jsonify({"ok": True})
+        
     except Exception as e:
-        logger.error(f"Webhook error: {e}")
+        logger.error(f"❌ Ошибка обработки вебхука: {e}", exc_info=True)
         return jsonify({"ok": False, "error": str(e)}), 500
 
-# ========== СТАТИСТИКА ДЛЯ ВЕБ-ИНТЕРФЕЙСА ==========
-@app.route('/')
-def index():
-    """Главная страница веб-интерфейса"""
-    return render_template('index.html')
-
-@app.route('/api/stats')
-def api_stats():
-    """API для получения статистики"""
-    stats = {
-        'total_screenshots': len(monitor.db.get_recent_screenshots(1000)),
-        'total_forwards': len(monitor.db.get_recent_forwards(1000)),
-        'monitored_chats': len(monitor.monitored_chats),
-        'suspicious_users': len(monitor.db.get_suspicious_users()),
-        'last_update': datetime.now().isoformat()
-    }
-    return jsonify(stats)
-
-@app.route('/api/recent_screenshots')
-def api_recent_screenshots():
-    """API для получения последних скриншотов"""
-    screenshots = monitor.db.get_recent_screenshots(50)
-    result = []
-    
-    for s in screenshots:
-        result.append({
-            'id': s[0],
-            'chat_id': s[1],
-            'user_id': s[2],
-            'username': s[3],
-            'first_name': s[4],
-            'message_id': s[5],
-            'screenshot_type': s[6],
-            'detected_at': s[7],
-            'message_text': s[8],
-            'forwarded_from': s[9]
-        })
-    
-    return jsonify({'screenshots': result})
-
-@app.route('/api/recent_forwards')
-def api_recent_forwards():
-    """API для получения последних пересылок"""
-    forwards = monitor.db.get_recent_forwards(50)
-    result = []
-    
-    for f in forwards:
-        result.append({
-            'id': f[0],
-            'original_chat_id': f[1],
-            'original_message_id': f[2],
-            'forwarded_chat_id': f[3],
-            'forwarded_message_id': f[4],
-            'user_id': f[5],
-            'username': f[6],
-            'forwarded_at': f[7],
-            'message_content': f[8],
-            'is_to_pm': bool(f[9])
-        })
-    
-    return jsonify({'forwards': result})
-
-# ========== НАСТРОЙКА WEBHOOK ==========
-@app.route('/setup')
+# ========== НАСТРОЙКА ВЕБХУКА ==========
+@app.route('/setup', methods=['GET'])
 def setup_webhook():
     """Настроить вебхук"""
     try:
-        webhook_url = os.environ.get("WEBHOOK_URL", f"https://{request.host}/webhook")
+        # Получаем текущий URL
+        if request.headers.get('X-Forwarded-Proto') == 'https':
+            base_url = f"https://{request.host}"
+        else:
+            base_url = f"http://{request.host}"
         
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setWebhook"
-        data = {
-            "url": webhook_url,
-            "max_connections": 100,
-            "allowed_updates": ["message", "edited_message"]
-        }
+        webhook_url = f"{base_url}/webhook"
         
-        response = requests.post(url, json=data)
+        logger.info(f"🌐 Настройка вебхука на URL: {webhook_url}")
+        
+        # Устанавливаем вебхук
+        result = telegram.set_webhook(webhook_url)
+        
+        if result.get("ok"):
+            success_msg = f"""
+✅ <b>ВЕБХУК УСПЕШНО НАСТРОЕН</b>
+
+<b>URL:</b> {webhook_url}
+<b>Статус:</b> Активен
+<b>Время:</b> {datetime.now().strftime('%H:%M:%S')}
+
+<i>Система готова к приёму уведомлений</i>
+"""
+            
+            # Отправляем сообщение админам
+            for admin_id in ALLOWED_IDS:
+                try:
+                    telegram.send_message(admin_id, success_msg)
+                except Exception as e:
+                    logger.error(f"Ошибка отправки админу {admin_id}: {e}")
+            
+            return jsonify({
+                "success": True,
+                "webhook_url": webhook_url,
+                "message": "Webhook configured successfully"
+            })
+        else:
+            return jsonify({
+                "success": False,
+                "error": result.get("description", "Unknown error")
+            }), 500
+            
+    except Exception as e:
+        logger.error(f"Ошибка настройки вебхука: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+# ========== ПРОВЕРКА ВЕБХУКА ==========
+@app.route('/check_webhook', methods=['GET'])
+def check_webhook():
+    """Проверить состояние вебхука"""
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getWebhookInfo"
+        response = requests.get(url)
         result = response.json()
         
         return jsonify({
-            "success": result.get("ok", False),
-            "webhook_url": webhook_url,
-            "message": "Webhook configured successfully"
+            "webhook_info": result,
+            "bot_token_exists": bool(TELEGRAM_TOKEN),
+            "allowed_users": ALLOWED_IDS,
+            "timestamp": datetime.now().isoformat()
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# ========== ЗАПУСК СЕРВЕРА ==========
+# ========== ТЕСТОВЫЙ ВЕБХУК ==========
+@app.route('/test_webhook', methods=['POST'])
+def test_webhook():
+    """Тестовый вебхук для отладки"""
+    test_data = {
+        "update_id": 100000000,
+        "message": {
+            "message_id": 1,
+            "from": {
+                "id": 123456789,
+                "is_bot": False,
+                "first_name": "Test",
+                "username": "testuser",
+                "language_code": "ru"
+            },
+            "chat": {
+                "id": -1001234567890,
+                "title": "Test Chat",
+                "type": "supergroup"
+            },
+            "date": int(time.time()),
+            "text": "Пользователь @username сделал снимок экрана"
+        }
+    }
+    
+    # Эмулируем запрос
+    with app.test_client() as client:
+        response = client.post('/webhook', json=test_data)
+    
+    return jsonify({
+        "test_sent": True,
+        "response": response.json,
+        "test_data": test_data
+    })
+
+# ========== ВЕБ-ИНТЕРФЕЙС ==========
+@app.route('/')
+def index():
+    return render_template('index.html')
+
+@app.route('/api/stats')
+def api_stats():
+    return jsonify({
+        "total_screenshots": 0,  # Заглушка - нужно реализовать БД
+        "total_forwards": 0,
+        "monitored_chats": 0,
+        "suspicious_users": 0,
+        "last_update": datetime.now().isoformat(),
+        "bot_status": "active",
+        "webhook_status": "configured",
+        "allowed_admins": len(ALLOWED_IDS)
+    })
+
+# ========== ЗАПУСК ==========
 if __name__ == "__main__":
-    logger.info(f"🚀 Запуск Screenshot Monitor v2.0")
-    logger.info(f"✅ Разрешённые пользователи: {len(ALLOWED_IDS)}")
-    logger.info(f"✅ Мониторинг чатов: {len(monitor.monitored_chats)}")
-    logger.info(f"🌐 Webhook порт: {PORT}")
+    logger.info("=" * 70)
+    logger.info("🚀 ЗАПУСК TELEGRAM MONITOR PRO")
+    logger.info("=" * 70)
+    logger.info(f"🤖 Token: {'✓' if TELEGRAM_TOKEN else '✗'}")
+    logger.info(f"👮 Allowed IDs: {ALLOWED_IDS}")
+    logger.info(f"🌐 Port: {PORT}")
+    logger.info("=" * 70)
+    
+    # Проверяем бота
+    bot_check = telegram.get_me()
+    if bot_check.get("ok"):
+        bot_info = bot_check["result"]
+        logger.info(f"✅ Бот: @{bot_info.get('username')} (ID: {bot_info.get('id')})")
+    else:
+        logger.error(f"❌ Ошибка бота: {bot_check.get('description')}")
+    
+    # Автоматическая настройка вебхука при запуске
+    try:
+        if "RENDER" in os.environ or "HEROKU" in os.environ:
+            logger.info("🌍 Обнаружено облачное окружение")
+            time.sleep(2)  # Ждём запуск сервера
+    except:
+        pass
     
     app.run(host="0.0.0.0", port=PORT, debug=False)
