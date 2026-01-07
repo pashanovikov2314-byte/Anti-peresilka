@@ -1,2 +1,0 @@
-web: gunicorn --bind 0.0.0.0:$PORT bot:app
-worker: python telegram_listener.py
