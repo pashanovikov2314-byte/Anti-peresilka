@@ -1,70 +1,122 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-SILENT STATS BOT - Тихо собирает статистику, не пишет в чат
+SILENT STATS BOT v2.0 - Тихо собирает статистику с использованием aiohttp
 """
 
 import os
 import sys
 import json
 import time
-import hashlib
+import asyncio
 import logging
 import threading
 import datetime
 import re
-import asyncio
 from typing import Dict, List, Optional, Set, Any
-from collections import defaultdict, Counter
-from dataclasses import dataclass, field
-from enum import Enum
-import aiohttp
-from contextlib import suppress
+from collections import defaultdict
+from dataclasses import dataclass, field, asdict
+import traceback
+
+# Проверка импортов
+try:
+    import aiohttp
+    from aiohttp import ClientSession, ClientTimeout
+    AIOHTTP_AVAILABLE = True
+except ImportError:
+    AIOHTTP_AVAILABLE = False
+    print("❌ Установите aiohttp: pip install aiohttp")
+
+try:
+    from flask import Flask, jsonify, render_template_string
+    FLASK_AVAILABLE = True
+except ImportError:
+    FLASK_AVAILABLE = False
+    print("❌ Установите Flask: pip install Flask")
 
 # ========== КОНФИГУРАЦИЯ ==========
 class Config:
     """Конфигурация бота"""
+    
     # Обязательные
     TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
-    ALLOWED_USER_IDS = [int(x.strip()) for x in os.environ.get("ALLOWED_IDS", "").split(",") if x.strip()]
+    ALLOWED_USER_IDS = [
+        int(x.strip()) for x in os.environ.get("ALLOWED_IDS", "").split(",") 
+        if x.strip()
+    ]
     
     # Опциональные
-    DATA_FILE = os.environ.get("DATA_FILE", "bot_stats.json")
-    LOG_FILE = os.environ.get("LOG_FILE", "bot_activity.log")
-    CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "300"))  # секунд
-    SAVE_INTERVAL = int(os.environ.get("SAVE_INTERVAL", "600"))
+    DATA_FILE = os.environ.get("DATA_FILE", "telegram_stats.json")
+    LOG_FILE = os.environ.get("LOG_FILE", "bot.log")
+    LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
     
-    # Настройки детекции
+    # Настройки запросов
+    UPDATE_TIMEOUT = int(os.environ.get("UPDATE_TIMEOUT", "30"))
+    UPDATE_LIMIT = int(os.environ.get("UPDATE_LIMIT", "100"))
+    
+    # Детекция
     DETECT_FORWARDS = os.environ.get("DETECT_FORWARDS", "true").lower() == "true"
     DETECT_COPIES = os.environ.get("DETECT_COPIES", "true").lower() == "true"
     DETECT_SCREENSHOTS = os.environ.get("DETECT_SCREENSHOTS", "true").lower() == "true"
     
-    # Минимальная длина для анализа
-    MIN_TEXT_LENGTH = int(os.environ.get("MIN_TEXT_LENGTH", "10"))
+    # Веб-интерфейс
+    WEB_PORT = int(os.environ.get("PORT", "5000"))
+    WEB_HOST = os.environ.get("HOST", "0.0.0.0")
     
     @classmethod
     def validate(cls):
+        """Проверить конфигурацию"""
+        errors = []
+        
         if not cls.TELEGRAM_TOKEN:
-            raise ValueError("❌ TELEGRAM_TOKEN не установлен")
+            errors.append("❌ TELEGRAM_TOKEN не установлен")
+        
         if not cls.ALLOWED_USER_IDS:
-            raise ValueError("❌ ALLOWED_IDS не установлен (укажите хотя бы один ID через запятую)")
+            errors.append("❌ ALLOWED_IDS не установлен (укажите ID через запятую)")
+        
+        if not AIOHTTP_AVAILABLE:
+            errors.append("❌ aiohttp не установлен")
+        
+        if not FLASK_AVAILABLE:
+            errors.append("❌ Flask не установлен")
+        
+        if errors:
+            for error in errors:
+                print(error)
+            return False
+        
         return True
+    
+    @classmethod
+    def log_config(cls):
+        """Логировать конфигурацию"""
+        print("\n" + "="*50)
+        print("⚙️  КОНФИГУРАЦИЯ БОТА")
+        print("="*50)
+        print(f"🤖 Токен: {'Установлен' if cls.TELEGRAM_TOKEN else 'НЕТ!'}")
+        print(f"👥 Разрешённые ID: {cls.ALLOWED_USER_IDS}")
+        print(f"📊 Файл данных: {cls.DATA_FILE}")
+        print(f"📝 Лог файл: {cls.LOG_FILE}")
+        print(f"🔍 Детекция пересылок: {cls.DETECT_FORWARDS}")
+        print(f"🔍 Детекция копий: {cls.DETECT_COPIES}")
+        print(f"🔍 Детекция скриншотов: {cls.DETECT_SCREENSHOTS}")
+        print(f"🌐 Веб-порт: {cls.WEB_PORT}")
+        print("="*50 + "\n")
 
 # ========== МОДЕЛИ ДАННЫХ ==========
 @dataclass
-class MessageStats:
-    """Статистика по одному сообщению"""
+class MessageData:
+    """Данные одного сообщения"""
     message_id: int
     user_id: int
     chat_id: int
     timestamp: str
-    text_length: int = 0
-    has_forward: bool = False
-    has_reply: bool = False
-    has_media: bool = False
+    text: str = ""
+    is_forwarded: bool = False
     is_copy: bool = False
-    screenshot_risk: int = 0  # 0-100
-    detected_patterns: List[str] = field(default_factory=list)
+    screenshot_risk: int = 0
+    has_media: bool = False
+    reply_to: Optional[int] = None
 
 @dataclass
 class UserStats:
@@ -75,172 +127,158 @@ class UserStats:
     last_name: str = ""
     
     # Счётчики
-    total_messages: int = 0
-    forwarded_messages: int = 0
-    copied_messages: int = 0
-    replies_sent: int = 0
-    media_sent: int = 0
-    
-    # Риски
-    total_screenshot_risk: int = 0
-    high_risk_messages: int = 0
+    messages_count: int = 0
+    forwarded_count: int = 0
+    copied_count: int = 0
+    media_count: int = 0
+    replies_count: int = 0
     
     # Временные метки
     first_seen: str = ""
-    last_activity: str = ""
+    last_seen: str = ""
     
-    # Подробная статистика
-    hourly_activity: Dict[int, int] = field(default_factory=lambda: defaultdict(int))  # час -> количество
-    daily_activity: Dict[str, int] = field(default_factory=lambda: defaultdict(int))   # дата -> количество
-    word_frequency: Dict[str, int] = field(default_factory=lambda: defaultdict(int))   # слово -> частота
+    # Активность
+    daily_stats: Dict[str, int] = field(default_factory=lambda: defaultdict(int))  # дата -> количество
     
-    def update(self, msg_stats: MessageStats):
-        """Обновить статистику на основе нового сообщения"""
-        self.total_messages += 1
+    def update(self, message: MessageData):
+        """Обновить статистику на основе сообщения"""
+        self.messages_count += 1
         
-        if msg_stats.has_forward:
-            self.forwarded_messages += 1
-        if msg_stats.has_reply:
-            self.replies_sent += 1
-        if msg_stats.has_media:
-            self.media_sent += 1
-        if msg_stats.is_copy:
-            self.copied_messages += 1
-            
-        self.total_screenshot_risk += msg_stats.screenshot_risk
-        if msg_stats.screenshot_risk > 70:
-            self.high_risk_messages += 1
-            
-        # Обновить время
+        if message.is_forwarded:
+            self.forwarded_count += 1
+        
+        if message.is_copy:
+            self.copied_count += 1
+        
+        if message.has_media:
+            self.media_count += 1
+        
+        if message.reply_to:
+            self.replies_count += 1
+        
+        # Временные метки
         if not self.first_seen:
-            self.first_seen = msg_stats.timestamp
-        self.last_activity = msg_stats.timestamp
+            self.first_seen = message.timestamp
         
-        # Часовую активность
-        hour = datetime.datetime.fromisoformat(msg_stats.timestamp.replace('Z', '+00:00')).hour
-        self.hourly_activity[hour] += 1
+        self.last_seen = message.timestamp
         
-        # Дневную активность
-        date = msg_stats.timestamp[:10]
-        self.daily_activity[date] += 1
+        # Дневная статистика
+        date = message.timestamp[:10]  # YYYY-MM-DD
+        self.daily_stats[date] += 1
 
 @dataclass
 class ChatStats:
     """Статистика чата"""
     chat_id: int
-    title: str = ""
+    title: str = "Unknown Chat"
     
-    total_messages: int = 0
-    total_users: int = 0
+    messages_count: int = 0
+    users_count: int = 0
     active_days: Set[str] = field(default_factory=set)
     
-    # Топы
-    top_posters: Dict[int, int] = field(default_factory=lambda: defaultdict(int))  # user_id -> количество
-    top_words: Dict[str, int] = field(default_factory=lambda: defaultdict(int))     # слово -> частота
+    # Проценты
+    forwarded_percent: float = 0.0
+    copied_percent: float = 0.0
     
-    # Аналитика
-    messages_per_day: Dict[str, int] = field(default_factory=lambda: defaultdict(int))
-    forwarded_percentage: float = 0.0
-    copy_percentage: float = 0.0
-    
-    def update(self, msg_stats: MessageStats):
+    def update(self, message: MessageData, users_in_chat: Set[int]):
         """Обновить статистику чата"""
-        self.total_messages += 1
+        self.messages_count += 1
+        self.users_count = len(users_in_chat)
         
-        # Добавить день активности
-        date = msg_stats.timestamp[:10]
+        # Активные дни
+        date = message.timestamp[:10]
         self.active_days.add(date)
-        self.messages_per_day[date] += 1
-        
-        # Обновить топ постеров
-        self.top_posters[msg_stats.user_id] += 1
-        
-        # Рассчитать проценты (раз в 100 сообщений)
-        if self.total_messages % 100 == 0:
-            self._calculate_percentages()
-    
-    def _calculate_percentages(self):
-        """Рассчитать процентные соотношения"""
-        # Это заглушка - реальные проценты считаются на основе данных
-        pass
 
 # ========== АНАЛИЗАТОР СООБЩЕНИЙ ==========
 class MessageAnalyzer:
-    """Тихий анализатор сообщений"""
+    """Анализатор сообщений для детекции"""
     
     def __init__(self):
+        # Ключевые слова для скриншотов
         self.screenshot_keywords = [
             'скрин', 'screenshot', 'снимок экрана', 'заскринил',
-            'сохранил себе', 'у меня есть', 'покажу всем',
-            'распространил', 'переслал всем', 'разошлю',
-            'сохранено', 'сохранилось', 'запомнил',
-            'зафиксировал', 'запечатлел', 'снял на фото',
-            'фото экрана', 'картинка чата', 'сохрани скрин'
+            'сохранил себе', 'у меня есть скрин', 'я сделал скрин',
+            'запомнил', 'зафиксировал', 'снял на фото',
+            'фото экрана', 'картинка чата', 'сохранено',
+            'распространил', 'покажу всем', 'разошлю'
         ]
         
+        # Паттерны копирования
         self.copy_patterns = [
-            r'(скопировал|копирую|копипаст|copy|copied|взял|украл)',
-            r'(целиком|полностью|весь текст|всё как есть)',
-            r'(сохранил|заберу|возьму себе|для себя)'
+            r'скопировал',
+            r'копирую',
+            r'copy',
+            r'взял текст',
+            r'украл сообщение',
+            r'целиком',
+            r'полностью как есть'
         ]
         
-    def analyze(self, message: Dict) -> MessageStats:
-        """Проанализировать сообщение без ответа"""
-        msg_stats = MessageStats(
-            message_id=message.get('message_id', 0),
-            user_id=message.get('from', {}).get('id', 0),
-            chat_id=message.get('chat', {}).get('id', 0),
+        # Стоп-слова (игнорировать)
+        self.stop_words = {'привет', 'пока', 'ок', 'спасибо', 'да', 'нет', 'ладно'}
+    
+    def analyze(self, message_json: Dict) -> MessageData:
+        """Проанализировать сообщение Telegram"""
+        # Базовые данные
+        msg_data = MessageData(
+            message_id=message_json.get('message_id', 0),
+            user_id=message_json.get('from', {}).get('id', 0),
+            chat_id=message_json.get('chat', {}).get('id', 0),
             timestamp=datetime.datetime.now().isoformat()
         )
         
-        # Проверка текста
-        text = message.get('text') or message.get('caption') or ""
-        msg_stats.text_length = len(text)
+        # Текст сообщения
+        text = message_json.get('text') or message_json.get('caption') or ""
+        msg_data.text = text
         
-        # Пересылка
-        msg_stats.has_forward = 'forward_date' in message
+        # Проверка на пересылку
+        if 'forward_date' in message_json and Config.DETECT_FORWARDS:
+            msg_data.is_forwarded = True
         
-        # Ответ
-        msg_stats.has_reply = 'reply_to_message' in message
+        # Проверка на медиа
+        msg_data.has_media = any(key in message_json 
+                                for key in ['photo', 'video', 'audio', 'document', 'voice', 'sticker'])
         
-        # Медиа
-        msg_stats.has_media = any(key in message for key in 
-                                 ['photo', 'video', 'document', 'audio', 'voice'])
+        # Проверка на ответ
+        if 'reply_to_message' in message_json:
+            msg_data.reply_to = message_json['reply_to_message'].get('message_id')
         
-        # Проверка на копирование
-        if text and len(text) >= Config.MIN_TEXT_LENGTH:
-            msg_stats.is_copy = self._check_copy(text, message)
-        
-        # Проверка на скриншоты
-        if text:
-            msg_stats.screenshot_risk = self._check_screenshot_risk(text)
+        # Анализ текста
+        if text and len(text.strip()) > 3:
+            # Проверка на копирование
+            if Config.DETECT_COPIES:
+                msg_data.is_copy = self._check_copy(text, message_json)
             
-        return msg_stats
+            # Проверка на скриншоты
+            if Config.DETECT_SCREENSHOTS:
+                msg_data.screenshot_risk = self._check_screenshot_risk(text)
+        
+        return msg_data
     
-    def _check_copy(self, text: str, message: Dict) -> bool:
+    def _check_copy(self, text: str, message_json: Dict) -> bool:
         """Проверить, является ли сообщение копией"""
-        if not Config.DETECT_COPIES:
-            return False
-            
-        # Если есть reply_to_message, сравниваем тексты
-        if 'reply_to_message' in message:
-            reply_text = message['reply_to_message'].get('text') or message['reply_to_message'].get('caption') or ""
-            if reply_text and self._text_similarity(text, reply_text) > 0.8:
-                return True
+        text_lower = text.lower()
         
         # Проверка по паттернам
-        text_lower = text.lower()
         for pattern in self.copy_patterns:
-            if re.search(pattern, text_lower):
+            if re.search(pattern, text_lower, re.IGNORECASE):
                 return True
-                
+        
+        # Проверка на копирование из ответа
+        if 'reply_to_message' in message_json:
+            reply_text = (message_json['reply_to_message'].get('text') or 
+                         message_json['reply_to_message'].get('caption') or "")
+            
+            if reply_text and self._calculate_similarity(text, reply_text) > 0.7:
+                return True
+        
         return False
     
     def _check_screenshot_risk(self, text: str) -> int:
         """Оценить риск скриншота (0-100)"""
-        if not Config.DETECT_SCREENSHOTS:
+        if not text:
             return 0
-            
+        
         text_lower = text.lower()
         risk_score = 0
         
@@ -248,38 +286,48 @@ class MessageAnalyzer:
         for keyword in self.screenshot_keywords:
             if keyword in text_lower:
                 risk_score += 20
-                
-        # Проверка контекста
-        if any(phrase in text_lower for phrase in 
-               ['покажу', 'распростран', 'разошлю', 'всем покажу', 'покажу всем']):
-            risk_score += 30
-            
-        if any(phrase in text_lower for phrase in 
-               ['сохрани', 'запомни', 'зафиксировал']):
-            risk_score += 25
-            
+        
+        # Проверка контекстных фраз
+        dangerous_phrases = [
+            ('покажу', 'всем'),
+            ('распростран', ''),
+            ('разошлю', ''),
+            ('сохран', 'себе'),
+            ('запомн', 'навсегда')
+        ]
+        
+        for phrase, context in dangerous_phrases:
+            if phrase in text_lower:
+                risk_score += 15
+                if context and context in text_lower:
+                    risk_score += 10
+        
         return min(100, risk_score)
     
-    def _text_similarity(self, text1: str, text2: str) -> float:
-        """Вычислить схожесть текстов"""
+    def _calculate_similarity(self, text1: str, text2: str) -> float:
+        """Вычислить схожесть двух текстов"""
         if not text1 or not text2:
             return 0.0
-            
-        # Привести к нижнему регистру и убрать лишние пробелы
-        t1 = re.sub(r'\s+', ' ', text1.lower().strip())
-        t2 = re.sub(r'\s+', ' ', text2.lower().strip())
         
-        # Если тексты идентичны
-        if t1 == t2:
+        # Очистка текста
+        clean1 = re.sub(r'\s+', ' ', text1.strip().lower())
+        clean2 = re.sub(r'\s+', ' ', text2.strip().lower())
+        
+        if clean1 == clean2:
             return 1.0
-            
-        # Вычислить схожесть по словам
-        words1 = set(t1.split())
-        words2 = set(t2.split())
+        
+        # Разделить на слова
+        words1 = set(clean1.split())
+        words2 = set(clean2.split())
+        
+        # Удалить стоп-слова
+        words1 = words1 - self.stop_words
+        words2 = words2 - self.stop_words
         
         if not words1 or not words2:
             return 0.0
-            
+        
+        # Коэффициент Жаккара
         intersection = len(words1.intersection(words2))
         union = len(words1.union(words2))
         
@@ -290,197 +338,301 @@ class DataStorage:
     """Хранилище статистики"""
     
     def __init__(self):
+        self.messages: List[MessageData] = []
         self.users: Dict[int, UserStats] = {}
         self.chats: Dict[int, ChatStats] = {}
-        self.messages: List[MessageStats] = []
         self.analyzer = MessageAnalyzer()
         
-        # Загрузить существующие данные
-        self.load()
+        # Для быстрого доступа
+        self.chat_users: Dict[int, Set[int]] = defaultdict(set)
         
-    def add_message(self, message: Dict) -> Optional[MessageStats]:
-        """Добавить сообщение в статистику"""
+        # Загрузить сохранённые данные
+        self.load()
+    
+    def add_message(self, message_json: Dict) -> Optional[MessageData]:
+        """Добавить сообщение в хранилище"""
         try:
             # Проверить пользователя
-            user_id = message.get('from', {}).get('id', 0)
+            user_id = message_json.get('from', {}).get('id', 0)
             if user_id not in Config.ALLOWED_USER_IDS:
-                return None  # Игнорируем сообщения от неразрешённых пользователей
+                return None  # Игнорируем неразрешённых пользователей
             
-            # Проанализировать
-            msg_stats = self.analyzer.analyze(message)
+            # Проанализировать сообщение
+            message_data = self.analyzer.analyze(message_json)
+            
+            # Добавить в список сообщений
+            self.messages.append(message_data)
             
             # Обновить пользователя
-            self._update_user_stats(msg_stats, message.get('from', {}))
+            self._update_user_stats(message_data, message_json.get('from', {}))
             
             # Обновить чат
-            self._update_chat_stats(msg_stats, message.get('chat', {}))
+            self._update_chat_stats(message_data, message_json.get('chat', {}))
             
-            # Сохранить сообщение
-            self.messages.append(msg_stats)
-            
-            # Автосохранение каждые 100 сообщений
-            if len(self.messages) % 100 == 0:
+            # Сохранить каждые 50 сообщений
+            if len(self.messages) % 50 == 0:
                 self.save()
-                
-            return msg_stats
+            
+            return message_data
             
         except Exception as e:
-            logging.error(f"Ошибка добавления сообщения: {e}")
+            print(f"❌ Ошибка добавления сообщения: {e}")
             return None
     
-    def _update_user_stats(self, msg_stats: MessageStats, user_data: Dict):
+    def _update_user_stats(self, message: MessageData, user_info: Dict):
         """Обновить статистику пользователя"""
-        user_id = msg_stats.user_id
+        user_id = message.user_id
         
         if user_id not in self.users:
             self.users[user_id] = UserStats(
                 user_id=user_id,
-                username=user_data.get('username', ''),
-                first_name=user_data.get('first_name', ''),
-                last_name=user_data.get('last_name', ''),
-                first_seen=msg_stats.timestamp
+                username=user_info.get('username', ''),
+                first_name=user_info.get('first_name', ''),
+                last_name=user_info.get('last_name', '')
             )
         
-        self.users[user_id].update(msg_stats)
-        
-        # Собираем частоту слов (если есть текст)
-        # Этот код можно расширить для анализа текста
+        self.users[user_id].update(message)
     
-    def _update_chat_stats(self, msg_stats: MessageStats, chat_data: Dict):
+    def _update_chat_stats(self, message: MessageData, chat_info: Dict):
         """Обновить статистику чата"""
-        chat_id = msg_stats.chat_id
+        chat_id = message.chat_id
         
         if chat_id not in self.chats:
             self.chats[chat_id] = ChatStats(
                 chat_id=chat_id,
-                title=chat_data.get('title', f'Chat {chat_id}')
+                title=chat_info.get('title', f'Chat {chat_id}')
             )
         
-        self.chats[chat_id].update(msg_stats)
-        self.chats[chat_id].total_users = len({
-            msg.user_id for msg in self.messages 
-            if msg.chat_id == chat_id
-        })
+        # Добавить пользователя в чат
+        self.chat_users[chat_id].add(message.user_id)
+        
+        # Обновить статистику чата
+        self.chats[chat_id].update(message, self.chat_users[chat_id])
+        
+        # Пересчитать проценты раз в 50 сообщений
+        if self.chats[chat_id].messages_count % 50 == 0:
+            self._recalculate_percentages(chat_id)
     
-    def get_user_report(self, user_id: int) -> Dict:
-        """Получить отчёт по пользователю"""
-        if user_id not in self.users:
-            return {"error": "Пользователь не найден"}
+    def _recalculate_percentages(self, chat_id: int):
+        """Пересчитать проценты для чата"""
+        chat_messages = [m for m in self.messages if m.chat_id == chat_id]
         
-        user = self.users[user_id]
-        chat_ids = {msg.chat_id for msg in self.messages if msg.user_id == user_id}
+        if not chat_messages:
+            return
         
-        return {
-            "user_id": user_id,
-            "username": user.username,
-            "first_name": user.first_name,
-            "last_name": user.last_name,
-            "total_messages": user.total_messages,
-            "forwarded_messages": user.forwarded_messages,
-            "copied_messages": user.copied_messages,
-            "replies_sent": user.replies_sent,
-            "media_sent": user.media_sent,
-            "screenshot_risk_score": user.total_screenshot_risk,
-            "high_risk_messages": user.high_risk_messages,
-            "first_seen": user.first_seen,
-            "last_activity": user.last_activity,
-            "active_chats": list(chat_ids),
-            "most_active_hour": max(user.hourly_activity.items(), key=lambda x: x[1], default=(None, 0))[0]
-        }
+        total = len(chat_messages)
+        forwarded = sum(1 for m in chat_messages if m.is_forwarded)
+        copied = sum(1 for m in chat_messages if m.is_copy)
+        
+        self.chats[chat_id].forwarded_percent = (forwarded / total) * 100 if total > 0 else 0
+        self.chats[chat_id].copied_percent = (copied / total) * 100 if total > 0 else 0
     
-    def get_chat_report(self, chat_id: int) -> Dict:
-        """Получить отчёт по чату"""
-        if chat_id not in self.chats:
-            return {"error": "Чат не найден"}
-        
-        chat = self.chats[chat_id]
-        chat_messages = [msg for msg in self.messages if msg.chat_id == chat_id]
-        
-        # Рассчитать проценты
-        if chat_messages:
-            forwarded = sum(1 for msg in chat_messages if msg.has_forward)
-            copied = sum(1 for msg in chat_messages if msg.is_copy)
-            
-            chat.forwarded_percentage = (forwarded / len(chat_messages)) * 100
-            chat.copy_percentage = (copied / len(chat_messages)) * 100
-        
-        # Топ постеров
-        top_posters = sorted(
-            [(uid, count) for uid, count in chat.top_posters.items()],
-            key=lambda x: x[1],
-            reverse=True
-        )[:5]
-        
-        return {
-            "chat_id": chat_id,
-            "title": chat.title,
-            "total_messages": chat.total_messages,
-            "total_users": chat.total_users,
-            "active_days": len(chat.active_days),
-            "forwarded_percentage": round(chat.forwarded_percentage, 2),
-            "copy_percentage": round(chat.copy_percentage, 2),
-            "top_posters": [
-                {"user_id": uid, "count": count, "username": self.users.get(uid, UserStats(uid)).username}
-                for uid, count in top_posters
-            ],
-            "activity_by_day": dict(sorted(chat.messages_per_day.items()))
-        }
+    # ========== API МЕТОДЫ ==========
     
     def get_overall_stats(self) -> Dict:
-        """Общая статистика"""
+        """Получить общую статистику"""
         total_messages = len(self.messages)
         total_users = len(self.users)
         total_chats = len(self.chats)
         
-        # Процент пересланных сообщений
-        forwarded = sum(1 for msg in self.messages if msg.has_forward)
-        forwarded_pct = (forwarded / total_messages * 100) if total_messages > 0 else 0
+        # Рассчитать проценты
+        forwarded_pct = 0
+        copied_pct = 0
         
-        # Процент копий
-        copied = sum(1 for msg in self.messages if msg.is_copy)
-        copied_pct = (copied / total_messages * 100) if total_messages > 0 else 0
+        if total_messages > 0:
+            forwarded = sum(1 for m in self.messages if m.is_forwarded)
+            copied = sum(1 for m in self.messages if m.is_copy)
+            
+            forwarded_pct = (forwarded / total_messages) * 100
+            copied_pct = (copied / total_messages) * 100
         
         # Самый активный пользователь
         most_active = max(
-            self.users.items(), 
-            key=lambda x: x[1].total_messages,
-            default=(None, UserStats(0))
+            self.users.values(),
+            key=lambda u: u.messages_count,
+            default=None
+        )
+        
+        # Самый активный чат
+        most_active_chat = max(
+            self.chats.values(),
+            key=lambda c: c.messages_count,
+            default=None
         )
         
         return {
+            "status": "ok",
+            "timestamp": datetime.datetime.now().isoformat(),
             "total_messages": total_messages,
             "total_users": total_users,
             "total_chats": total_chats,
             "forwarded_percentage": round(forwarded_pct, 2),
             "copied_percentage": round(copied_pct, 2),
             "most_active_user": {
-                "user_id": most_active[0],
-                "username": most_active[1].username,
-                "message_count": most_active[1].total_messages
-            } if most_active[0] else None,
-            "data_collection_started": min(
-                (msg.timestamp for msg in self.messages), 
-                default=datetime.datetime.now().isoformat()
-            )
+                "user_id": most_active.user_id if most_active else None,
+                "username": most_active.username if most_active else "",
+                "messages": most_active.messages_count if most_active else 0
+            },
+            "most_active_chat": {
+                "chat_id": most_active_chat.chat_id if most_active_chat else None,
+                "title": most_active_chat.title if most_active_chat else "",
+                "messages": most_active_chat.messages_count if most_active_chat else 0
+            },
+            "data_since": self.messages[0].timestamp[:10] if self.messages else "Нет данных"
+        }
+    
+    def get_user_stats(self, user_id: int) -> Dict:
+        """Получить статистику пользователя"""
+        if user_id not in self.users:
+            return {"error": "Пользователь не найден"}
+        
+        user = self.users[user_id]
+        
+        # Сообщения пользователя
+        user_messages = [m for m in self.messages if m.user_id == user_id]
+        
+        # Чаты пользователя
+        user_chats = {m.chat_id for m in user_messages}
+        
+        # Активность по дням
+        daily_activity = dict(sorted(
+            user.daily_stats.items(),
+            key=lambda x: x[0],
+            reverse=True
+        ))
+        
+        return {
+            "user_id": user_id,
+            "username": user.username,
+            "first_name": user.first_name,
+            "last_name": user.last_name,
+            "messages_total": user.messages_count,
+            "messages_forwarded": user.forwarded_count,
+            "messages_copied": user.copied_count,
+            "messages_with_media": user.media_count,
+            "replies_sent": user.replies_count,
+            "first_seen": user.first_seen[:19] if user.first_seen else "",
+            "last_seen": user.last_seen[:19] if user.last_seen else "",
+            "active_chats": list(user_chats),
+            "daily_activity": daily_activity,
+            "screenshot_risk_total": sum(m.screenshot_risk for m in user_messages),
+            "screenshot_high_risk_messages": sum(1 for m in user_messages if m.screenshot_risk > 50)
+        }
+    
+    def get_chat_stats(self, chat_id: int) -> Dict:
+        """Получить статистику чата"""
+        if chat_id not in self.chats:
+            return {"error": "Чат не найден"}
+        
+        chat = self.chats[chat_id]
+        chat_messages = [m for m in self.messages if m.chat_id == chat_id]
+        
+        # Топ пользователей в чате
+        user_counts = defaultdict(int)
+        for msg in chat_messages:
+            user_counts[msg.user_id] += 1
+        
+        top_users = sorted(
+            [(uid, count) for uid, count in user_counts.items()],
+            key=lambda x: x[1],
+            reverse=True
+        )[:10]
+        
+        # Детализация по пользователям
+        top_users_detailed = []
+        for uid, count in top_users:
+            user = self.users.get(uid)
+            if user:
+                top_users_detailed.append({
+                    "user_id": uid,
+                    "username": user.username,
+                    "first_name": user.first_name,
+                    "messages": count
+                })
+        
+        # Активность по дням
+        daily_counts = defaultdict(int)
+        for msg in chat_messages:
+            date = msg.timestamp[:10]
+            daily_counts[date] += 1
+        
+        daily_activity = dict(sorted(
+            daily_counts.items(),
+            key=lambda x: x[0],
+            reverse=True
+        ))
+        
+        return {
+            "chat_id": chat_id,
+            "title": chat.title,
+            "messages_total": chat.messages_count,
+            "users_total": chat.users_count,
+            "active_days": len(chat.active_days),
+            "forwarded_percentage": round(chat.forwarded_percent, 2),
+            "copied_percentage": round(chat.copied_percent, 2),
+            "top_users": top_users_detailed,
+            "daily_activity": daily_activity,
+            "first_message": chat_messages[0].timestamp[:19] if chat_messages else "",
+            "last_message": chat_messages[-1].timestamp[:19] if chat_messages else ""
+        }
+    
+    def get_all_users(self) -> List[Dict]:
+        """Получить список всех пользователей"""
+        users_list = []
+        for user_id in self.users:
+            user_data = self.get_user_stats(user_id)
+            if "error" not in user_data:
+                users_list.append(user_data)
+        
+        # Сортировка по количеству сообщений
+        users_list.sort(key=lambda x: x.get("messages_total", 0), reverse=True)
+        return users_list
+    
+    def get_all_chats(self) -> List[Dict]:
+        """Получить список всех чатов"""
+        chats_list = []
+        for chat_id in self.chats:
+            chat_data = self.get_chat_stats(chat_id)
+            if "error" not in chat_data:
+                chats_list.append(chat_data)
+        
+        # Сортировка по количеству сообщений
+        chats_list.sort(key=lambda x: x.get("messages_total", 0), reverse=True)
+        return chats_list
+    
+    def export_all_data(self) -> Dict:
+        """Экспорт всех данных"""
+        return {
+            "exported_at": datetime.datetime.now().isoformat(),
+            "overall_stats": self.get_overall_stats(),
+            "users": self.get_all_users(),
+            "chats": self.get_all_chats(),
+            "total_messages_stored": len(self.messages),
+            "config": {
+                "allowed_users": Config.ALLOWED_USER_IDS,
+                "detect_forwards": Config.DETECT_FORWARDS,
+                "detect_copies": Config.DETECT_COPIES,
+                "detect_screenshots": Config.DETECT_SCREENSHOTS
+            }
         }
     
     def save(self):
         """Сохранить данные в файл"""
         try:
             data = {
+                "messages": [asdict(m) for m in self.messages[-1000:]],  # Последние 1000 сообщений
                 "users": {uid: asdict(user) for uid, user in self.users.items()},
                 "chats": {cid: asdict(chat) for cid, chat in self.chats.items()},
-                "messages": [asdict(msg) for msg in self.messages[-10000:]],  # Сохраняем последние 10000 сообщений
                 "saved_at": datetime.datetime.now().isoformat()
             }
             
             with open(Config.DATA_FILE, 'w', encoding='utf-8') as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
-                
-            logging.info(f"Данные сохранены: {len(self.messages)} сообщений, {len(self.users)} пользователей")
+            
+            print(f"💾 Данные сохранены: {len(self.messages)} сообщений, {len(self.users)} пользователей")
             
         except Exception as e:
-            logging.error(f"Ошибка сохранения данных: {e}")
+            print(f"❌ Ошибка сохранения: {e}")
     
     def load(self):
         """Загрузить данные из файла"""
@@ -489,547 +641,291 @@ class DataStorage:
                 with open(Config.DATA_FILE, 'r', encoding='utf-8') as f:
                     data = json.load(f)
                 
-                # Восстановить пользователей
-                self.users.clear()
+                # Загрузить сообщения
+                self.messages = [MessageData(**msg) for msg in data.get("messages", [])]
+                
+                # Загрузить пользователей
+                self.users = {}
                 for uid_str, user_data in data.get("users", {}).items():
                     user = UserStats(**user_data)
                     self.users[user.user_id] = user
                 
-                # Восстановить чаты
-                self.chats.clear()
+                # Загрузить чаты
+                self.chats = {}
                 for cid_str, chat_data in data.get("chats", {}).items():
                     chat = ChatStats(**chat_data)
                     self.chats[chat.chat_id] = chat
                 
-                # Восстановить сообщения
-                self.messages = [MessageStats(**msg) for msg in data.get("messages", [])]
+                # Восстановить chat_users
+                self.chat_users.clear()
+                for msg in self.messages:
+                    self.chat_users[msg.chat_id].add(msg.user_id)
                 
-                logging.info(f"Данные загружены: {len(self.messages)} сообщений, {len(self.users)} пользователей")
+                print(f"📂 Данные загружены: {len(self.messages)} сообщений, {len(self.users)} пользователей")
                 
         except Exception as e:
-            logging.error(f"Ошибка загрузки данных: {e}")
+            print(f"⚠️ Не удалось загрузить данные: {e}")
 
 # ========== TELEGRAM БОТ ==========
 class SilentTelegramBot:
-    """Тихий бот, который только собирает статистику"""
+    """Тихий бот для сбора статистики"""
     
     def __init__(self):
         self.token = Config.TELEGRAM_TOKEN
         self.base_url = f"https://api.telegram.org/bot{self.token}"
         self.storage = DataStorage()
         self.running = False
+        self.last_update_id = 0
         
         # Настройка логирования
         logging.basicConfig(
             level=getattr(logging, Config.LOG_LEVEL),
-            format='%(asctime)s - %(levelname)s - %(message)s',
+            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
             handlers=[
                 logging.FileHandler(Config.LOG_FILE, encoding='utf-8'),
                 logging.StreamHandler()
             ]
         )
         
-        # Проверка конфигурации
-        Config.validate()
-        logging.info("Конфигурация проверена успешно")
+        self.logger = logging.getLogger(__name__)
     
-    async def get_updates(self, offset: int = 0, timeout: int = 30) -> List[Dict]:
-        """Получить обновления от Telegram"""
+    async def fetch_updates(self) -> List[Dict]:
+        """Получить обновления от Telegram API"""
         try:
             url = f"{self.base_url}/getUpdates"
             params = {
-                "offset": offset,
-                "timeout": timeout,
+                "offset": self.last_update_id + 1,
+                "timeout": Config.UPDATE_TIMEOUT,
+                "limit": Config.UPDATE_LIMIT,
                 "allowed_updates": ["message", "edited_message"]
             }
             
-            async with aiohttp.ClientSession() as session:
+            timeout = ClientTimeout(total=Config.UPDATE_TIMEOUT + 10)
+            
+            async with ClientSession(timeout=timeout) as session:
                 async with session.get(url, params=params) as response:
                     if response.status == 200:
                         data = await response.json()
-                        return data.get("result", [])
+                        if data.get("ok"):
+                            return data.get("result", [])
                     else:
-                        logging.error(f"Ошибка API: {response.status}")
-                        return []
+                        self.logger.error(f"API Error: {response.status}")
                         
+        except asyncio.TimeoutError:
+            self.logger.debug("Таймаут запроса обновлений")
         except Exception as e:
-            logging.error(f"Ошибка получения updates: {e}")
-            return []
-    
-    async def process_updates(self, updates: List[Dict]) -> int:
-        """Обработать обновления"""
-        last_update_id = 0
+            self.logger.error(f"Ошибка получения обновлений: {e}")
         
+        return []
+    
+    async def process_updates(self, updates: List[Dict]):
+        """Обработать полученные обновления"""
         for update in updates:
             update_id = update.get("update_id", 0)
-            last_update_id = max(last_update_id, update_id)
+            
+            if update_id > self.last_update_id:
+                self.last_update_id = update_id
             
             # Обработка сообщений
             if "message" in update:
-                message = update["message"]
+                await self._process_message(update["message"])
+            elif "edited_message" in update:
+                await self._process_message(update["edited_message"], edited=True)
+    
+    async def _process_message(self, message: Dict, edited: bool = False):
+        """Обработать одно сообщение"""
+        try:
+            # Игнорировать служебные сообщения
+            if any(key in message for key in 
+                  ['new_chat_members', 'left_chat_member', 'new_chat_title', 'new_chat_photo']):
+                return
+            
+            # Игнорировать команды
+            if message.get('text', '').startswith('/'):
+                return
+            
+            # Добавить в статистику
+            message_data = self.storage.add_message(message)
+            
+            if message_data:
+                user = message.get('from', {})
+                username = user.get('username', user.get('first_name', 'Unknown'))
                 
-                # Игнорируем служебные сообщения
-                if message.get("new_chat_members") or message.get("left_chat_member"):
-                    continue
-                    
-                # Игнорируем команды боту
-                if message.get("text", "").startswith("/"):
-                    continue
+                log_msg = f"📨 Сообщение {message_data.message_id} от {username} (ID: {message_data.user_id})"
                 
-                # Добавить в статистику
-                msg_stats = self.storage.add_message(message)
+                if edited:
+                    log_msg += " [РЕДАКТИРОВАНО]"
                 
-                if msg_stats:
-                    # Тихо логируем
-                    logging.debug(f"Сообщение {msg_stats.message_id} от {msg_stats.user_id} обработано")
-        
-        return last_update_id + 1 if last_update_id > 0 else 0
+                if message_data.is_forwarded:
+                    log_msg += " [ПЕРЕСЛАНО]"
+                
+                if message_data.is_copy:
+                    log_msg += " [КОПИЯ]"
+                
+                if message_data.screenshot_risk > 50:
+                    log_msg += f" [СКРИНШОТ РИСК: {message_data.screenshot_risk}%]"
+                
+                self.logger.info(log_msg)
+                
+        except Exception as e:
+            self.logger.error(f"Ошибка обработки сообщения: {e}")
     
     async def run(self):
-        """Основной цикл бота"""
+        """Основной цикл работы бота"""
         self.running = True
-        offset = 0
         
-        logging.info("🤖 Тихий бот запущен. Собираю статистику...")
-        logging.info(f"Разрешённые пользователи: {Config.ALLOWED_USER_IDS}")
-        logging.info(f"Детекция пересылок: {Config.DETECT_FORWARDS}")
-        logging.info(f"Детекция копирования: {Config.DETECT_COPIES}")
-        logging.info(f"Детекция скриншотов: {Config.DETECT_SCREENSHOTS}")
+        # Показать конфигурацию
+        Config.log_config()
         
-        # Автосохранение в фоне
+        # Проверить соединение
+        await self._test_connection()
+        
+        self.logger.info("🤖 Тихий бот запущен. Собираю статистику...")
+        self.logger.info(f"👥 Разрешённые пользователи: {Config.ALLOWED_USER_IDS}")
+        self.logger.info("📊 Бот работает в тихом режиме (не пишет в чаты)")
+        
+        # Автосохранение в фоновом потоке
         def auto_save():
             while self.running:
-                time.sleep(Config.SAVE_INTERVAL)
+                time.sleep(300)  # Каждые 5 минут
                 self.storage.save()
         
         save_thread = threading.Thread(target=auto_save, daemon=True)
         save_thread.start()
         
-        # Основной цикл обработки
+        # Основной цикл
         while self.running:
             try:
-                updates = await self.get_updates(offset)
+                updates = await self.fetch_updates()
                 
                 if updates:
-                    new_offset = await self.process_updates(updates)
-                    if new_offset > offset:
-                        offset = new_offset
-                
-                # Пауза между запросами
-                await asyncio.sleep(1)
-                
+                    await self.process_updates(updates)
+                else:
+                    # Пауза между запросами
+                    await asyncio.sleep(1)
+                    
             except KeyboardInterrupt:
-                logging.info("Получен сигнал остановки")
+                self.logger.info("🛑 Остановка по запросу пользователя")
                 break
                 
             except Exception as e:
-                logging.error(f"Ошибка в основном цикле: {e}")
+                self.logger.error(f"Ошибка в основном цикле: {e}")
                 await asyncio.sleep(5)
         
         # Финальное сохранение
         self.storage.save()
-        logging.info("Бот остановлен")
+        self.logger.info("Бот остановлен")
+    
+    async def _test_connection(self):
+        """Проверить соединение с Telegram API"""
+        try:
+            url = f"{self.base_url}/getMe"
+            async with ClientSession() as session:
+                async with session.get(url) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        if data.get("ok"):
+                            bot_info = data.get("result", {})
+                            self.logger.info(f"✅ Бот @{bot_info.get('username')} подключён")
+                            return True
+            
+            self.logger.error("❌ Не удалось подключиться к Telegram API")
+            return False
+            
+        except Exception as e:
+            self.logger.error(f"❌ Ошибка подключения: {e}")
+            return False
     
     def stop(self):
         """Остановить бота"""
         self.running = False
 
-# ========== ВЕБ-ИНТЕРФЕЙС ДЛЯ СТАТИСТИКИ ==========
-from flask import Flask, jsonify, render_template_string
-
-app = Flask(__name__)
-bot_instance = None
-
-# HTML шаблон для веб-интерфейса
-HTML_TEMPLATE = """
-<!DOCTYPE html>
-<html>
-<head>
-    <title>📊 Статистика Silent Bot</title>
-    <meta charset="utf-8">
-    <style>
-        body {
-            font-family: 'Segoe UI', Arial, sans-serif;
-            max-width: 1200px;
-            margin: 0 auto;
-            padding: 20px;
-            background: #f5f5f5;
-            color: #333;
-        }
-        .header {
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
-            padding: 30px;
-            border-radius: 10px;
-            margin-bottom: 30px;
-            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
-        }
-        .card {
-            background: white;
-            border-radius: 10px;
-            padding: 25px;
-            margin-bottom: 25px;
-            box-shadow: 0 2px 4px rgba(0,0,0,0.05);
-            transition: transform 0.2s;
-        }
-        .card:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 4px 8px rgba(0,0,0,0.1);
-        }
-        .stats-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
-            gap: 20px;
-            margin-bottom: 30px;
-        }
-        .stat-box {
-            background: white;
-            padding: 20px;
-            border-radius: 8px;
-            text-align: center;
-            box-shadow: 0 2px 4px rgba(0,0,0,0.05);
-        }
-        .stat-value {
-            font-size: 2.5em;
-            font-weight: bold;
-            color: #667eea;
-            margin: 10px 0;
-        }
-        .stat-label {
-            color: #666;
-            font-size: 0.9em;
-        }
-        .user-list, .chat-list {
-            display: grid;
-            gap: 15px;
-        }
-        .user-item, .chat-item {
-            background: white;
-            padding: 15px;
-            border-radius: 8px;
-            border-left: 4px solid #667eea;
-        }
-        table {
-            width: 100%;
-            border-collapse: collapse;
-            margin: 20px 0;
-        }
-        th, td {
-            padding: 12px 15px;
-            text-align: left;
-            border-bottom: 1px solid #ddd;
-        }
-        th {
-            background: #f8f9fa;
-            font-weight: 600;
-        }
-        tr:hover {
-            background: #f5f7fa;
-        }
-        .badge {
-            display: inline-block;
-            padding: 4px 8px;
-            border-radius: 12px;
-            font-size: 0.8em;
-            font-weight: 600;
-        }
-        .badge-success { background: #d4edda; color: #155724; }
-        .badge-warning { background: #fff3cd; color: #856404; }
-        .badge-danger { background: #f8d7da; color: #721c24; }
-        .code {
-            font-family: 'Consolas', monospace;
-            background: #f8f9fa;
-            padding: 15px;
-            border-radius: 5px;
-            overflow-x: auto;
-        }
-    </style>
-</head>
-<body>
-    <div class="header">
-        <h1>🤫 Silent Telegram Bot</h1>
-        <p>Тихая система сбора статистики сообщений</p>
-        <p style="opacity: 0.8;">Бот работает в режиме полной тишины, не пишет в чаты</p>
-    </div>
+# ========== ВЕБ-ИНТЕРФЕЙС ==========
+def setup_web_interface(bot_instance: SilentTelegramBot):
+    """Настройка Flask веб-интерфейса"""
+    if not FLASK_AVAILABLE:
+        print("❌ Flask не установлен, веб-интерфейс недоступен")
+        return None
     
-    {% if overall_stats %}
-    <div class="stats-grid">
-        <div class="stat-box">
-            <div class="stat-label">Всего сообщений</div>
-            <div class="stat-value">{{ overall_stats.total_messages }}</div>
-        </div>
-        <div class="stat-box">
-            <div class="stat-label">Пользователей</div>
-            <div class="stat-value">{{ overall_stats.total_users }}</div>
-        </div>
-        <div class="stat-box">
-            <div class="stat-label">Чатов</div>
-            <div class="stat-value">{{ overall_stats.total_chats }}</div>
-        </div>
-        <div class="stat-box">
-            <div class="stat-label">Пересылок</div>
-            <div class="stat-value">{{ overall_stats.forwarded_percentage }}%</div>
-        </div>
-    </div>
-    {% endif %}
+    app = Flask(__name__)
     
-    <div class="card">
-        <h2>📈 Общая статистика</h2>
-        {% if overall_stats %}
-        <table>
-            <tr>
-                <th>Показатель</th>
-                <th>Значение</th>
-            </tr>
-            <tr>
-                <td>Всего сообщений</td>
-                <td>{{ overall_stats.total_messages }}</td>
-            </tr>
-            <tr>
-                <td>Всего пользователей</td>
-                <td>{{ overall_stats.total_users }}</td>
-            </tr>
-            <tr>
-                <td>Всего чатов</td>
-                <td>{{ overall_stats.total_chats }}</td>
-            </tr>
-            <tr>
-                <td>Процент пересланных</td>
-                <td>{{ overall_stats.forwarded_percentage }}%</td>
-            </tr>
-            <tr>
-                <td>Процент скопированных</td>
-                <td>{{ overall_stats.copied_percentage }}%</td>
-            </tr>
-            <tr>
-                <td>Сбор данных с</td>
-                <td>{{ overall_stats.data_collection_started[:19] }}</td>
-            </tr>
-        </table>
-        {% else %}
-        <p>Нет данных для отображения</p>
-        {% endif %}
-    </div>
-    
-    <div class="card">
-        <h2>👥 Пользователи</h2>
-        {% if users %}
-        <table>
-            <tr>
-                <th>ID</th>
-                <th>Имя</th>
-                <th>Сообщений</th>
-                <th>Пересылок</th>
-                <th>Копий</th>
-                <th>Риск скриншотов</th>
-                <th>Активность</th>
-            </tr>
-            {% for user in users[:20] %}
-            <tr>
-                <td>{{ user.user_id }}</td>
-                <td>{{ user.first_name }} {{ user.last_name }}</td>
-                <td>{{ user.total_messages }}</td>
-                <td>{{ user.forwarded_messages }}</td>
-                <td>{{ user.copied_messages }}</td>
-                <td>
-                    {% if user.screenshot_risk_score > 100 %}
-                    <span class="badge badge-danger">Высокий</span>
-                    {% elif user.screenshot_risk_score > 50 %}
-                    <span class="badge badge-warning">Средний</span>
-                    {% else %}
-                    <span class="badge badge-success">Низкий</span>
-                    {% endif %}
-                </td>
-                <td>{{ user.last_activity[:19] }}</td>
-            </tr>
-            {% endfor %}
-        </table>
-        {% else %}
-        <p>Нет данных о пользователях</p>
-        {% endif %}
-    </div>
-    
-    <div class="card">
-        <h2>💬 Чаты</h2>
-        {% if chats %}
-        <table>
-            <tr>
-                <th>ID</th>
-                <th>Название</th>
-                <th>Сообщений</th>
-                <th>Участников</th>
-                <th>Активных дней</th>
-                <th>Пересылок</th>
-            </tr>
-            {% for chat in chats %}
-            <tr>
-                <td>{{ chat.chat_id }}</td>
-                <td>{{ chat.title }}</td>
-                <td>{{ chat.total_messages }}</td>
-                <td>{{ chat.total_users }}</td>
-                <td>{{ chat.active_days }}</td>
-                <td>{{ chat.forwarded_percentage }}%</td>
-            </tr>
-            {% endfor %}
-        </table>
-        {% else %}
-        <p>Нет данных о чатах</p>
-        {% endif %}
-    </div>
-    
-    <div class="card">
-        <h2>⚙️ Конфигурация</h2>
-        <div class="code">
-TELEGRAM_TOKEN = ********<br>
-ALLOWED_USER_IDS = {{ allowed_users }}<br>
-DETECT_FORWARDS = {{ detect_forwards }}<br>
-DETECT_COPIES = {{ detect_copies }}<br>
-DETECT_SCREENSHOTS = {{ detect_screenshots }}<br>
-DATA_FILE = {{ data_file }}
-        </div>
-    </div>
-    
-    <div class="card">
-        <h2>📊 API Endpoints</h2>
-        <p>Доступные API endpoints:</p>
-        <ul>
-            <li><code>/api/stats</code> - Общая статистика</li>
-            <li><code>/api/users</code> - Список пользователей</li>
-            <li><code>/api/user/&lt;user_id&gt;</code> - Статистика пользователя</li>
-            <li><code>/api/chats</code> - Список чатов</li>
-            <li><code>/api/chat/&lt;chat_id&gt;</code> - Статистика чата</li>
-            <li><code>/api/export</code> - Экспорт всех данных (JSON)</li>
-        </ul>
-    </div>
-</body>
-</html>
-"""
-
-@app.route('/')
-def index():
-    """Главная страница с статистикой"""
-    if not bot_instance:
-        return "Бот не запущен"
-    
-    storage = bot_instance.storage
-    
-    # Получить данные
-    overall_stats = storage.get_overall_stats()
-    users = [storage.get_user_report(uid) for uid in storage.users.keys()]
-    chats = [storage.get_chat_report(cid) for cid in storage.chats.keys()]
-    
-    # Отфильтровать ошибки
-    users = [u for u in users if "error" not in u]
-    chats = [c for c in chats if "error" not in c]
-    
-    return render_template_string(HTML_TEMPLATE,
-        overall_stats=overall_stats,
-        users=users[:50],  # Ограничиваем для скорости
-        chats=chats[:20],
-        allowed_users=Config.ALLOWED_USER_IDS,
-        detect_forwards=Config.DETECT_FORWARDS,
-        detect_copies=Config.DETECT_COPIES,
-        detect_screenshots=Config.DETECT_SCREENSHOTS,
-        data_file=Config.DATA_FILE
-    )
-
-@app.route('/api/stats')
-def api_stats():
-    """API: общая статистика"""
-    if not bot_instance:
-        return jsonify({"error": "Бот не запущен"})
-    return jsonify(bot_instance.storage.get_overall_stats())
-
-@app.route('/api/users')
-def api_users():
-    """API: список пользователей"""
-    if not bot_instance:
-        return jsonify({"error": "Бот не запущен"})
-    
-    users = []
-    for uid in bot_instance.storage.users.keys():
-        user_data = bot_instance.storage.get_user_report(uid)
-        if "error" not in user_data:
-            users.append(user_data)
-    
-    return jsonify({"users": users, "count": len(users)})
-
-@app.route('/api/user/<int:user_id>')
-def api_user(user_id):
-    """API: статистика пользователя"""
-    if not bot_instance:
-        return jsonify({"error": "Бот не запущен"})
-    return jsonify(bot_instance.storage.get_user_report(user_id))
-
-@app.route('/api/chats')
-def api_chats():
-    """API: список чатов"""
-    if not bot_instance:
-        return jsonify({"error": "Бот не запущен"})
-    
-    chats = []
-    for cid in bot_instance.storage.chats.keys():
-        chat_data = bot_instance.storage.get_chat_report(cid)
-        if "error" not in chat_data:
-            chats.append(chat_data)
-    
-    return jsonify({"chats": chats, "count": len(chats)})
-
-@app.route('/api/chat/<int:chat_id>')
-def api_chat(chat_id):
-    """API: статистика чата"""
-    if not bot_instance:
-        return jsonify({"error": "Бот не запущен"})
-    return jsonify(bot_instance.storage.get_chat_report(chat_id))
-
-@app.route('/api/export')
-def api_export():
-    """API: экспорт всех данных"""
-    if not bot_instance:
-        return jsonify({"error": "Бот не запущен"})
-    
-    data = {
-        "overall": bot_instance.storage.get_overall_stats(),
-        "users": {},
-        "chats": {},
-        "exported_at": datetime.datetime.now().isoformat()
-    }
-    
-    for uid in bot_instance.storage.users.keys():
-        data["users"][uid] = bot_instance.storage.get_user_report(uid)
-    
-    for cid in bot_instance.storage.chats.keys():
-        data["chats"][cid] = bot_instance.storage.get_chat_report(cid)
-    
-    return jsonify(data)
-
-# ========== ЗАПУСК ==========
-def main():
-    """Основная функция запуска"""
-    global bot_instance
-    
-    try:
-        # Проверка конфигурации
-        Config.validate()
-        
-        # Создание бота
-        bot_instance = SilentTelegramBot()
-        
-        # Запуск Flask в отдельном потоке
-        def run_flask():
-            app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)), debug=False)
-        
-        flask_thread = threading.Thread(target=run_flask, daemon=True)
-        flask_thread.start()
-        
-        # Запуск бота
-        asyncio.run(bot_instance.run())
-        
-    except KeyboardInterrupt:
-        print("\n🛑 Бот остановлен пользователем")
-    except Exception as e:
-        print(f"❌ Критическая ошибка: {e}")
-        traceback.print_exc()
-
-if __name__ == "__main__":
-    main()
+    # HTML шаблон
+    HTML_TEMPLATE = '''
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="utf-8">
+        <title>📊 Silent Stats Bot</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <style>
+            * { margin: 0; padding: 0; box-sizing: border-box; }
+            body {
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                color: #333;
+                min-height: 100vh;
+                padding: 20px;
+            }
+            .container {
+                max-width: 1200px;
+                margin: 0 auto;
+            }
+            .header {
+                background: rgba(255, 255, 255, 0.95);
+                padding: 30px;
+                border-radius: 15px;
+                margin-bottom: 30px;
+                box-shadow: 0 10px 30px rgba(0,0,0,0.1);
+                text-align: center;
+            }
+            .header h1 {
+                color: #667eea;
+                margin-bottom: 10px;
+                font-size: 2.5em;
+            }
+            .header p {
+                color: #666;
+                font-size: 1.1em;
+                opacity: 0.9;
+            }
+            .stats-grid {
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+                gap: 20px;
+                margin-bottom: 30px;
+            }
+            .stat-card {
+                background: rgba(255, 255, 255, 0.95);
+                padding: 25px;
+                border-radius: 15px;
+                box-shadow: 0 5px 15px rgba(0,0,0,0.08);
+                transition: transform 0.3s, box-shadow 0.3s;
+            }
+            .stat-card:hover {
+                transform: translateY(-5px);
+                box-shadow: 0 15px 30px rgba(0,0,0,0.15);
+            }
+            .stat-card .value {
+                font-size: 2.5em;
+                font-weight: bold;
+                color: #667eea;
+                margin: 10px 0;
+            }
+            .stat-card .label {
+                color: #666;
+                font-size: 0.9em;
+                text-transform: uppercase;
+                letter-spacing: 1px;
+            }
+            .section {
+                background: rgba(255, 255, 255, 0.95);
+                padding: 30px;
+                border-radius: 15px;
+                margin-bottom: 30px;
+                box-shadow: 0 5px 15px rgba(0,0,0,0.08);
+            }
+            .section h2 {
+                color: #667eea;
+                margin-bottom: 20px;
+                padding-bottom: 10px;
+                border-bottom: 2px
