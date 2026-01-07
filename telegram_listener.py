@@ -331,3 +331,34 @@ class TelegramLeakListener:
             leak_info['username'] = message.from_user.username or f"id{user_id}"
             leak_info['first_name'] = message.from_user.first_name or ""
             leak_info['last_name'] = message.from_user.last_name or ""
+            leak_info['user_id'] = user_id
+            
+            # Отправка на сервер
+            if RENDER_URL and API_KEY:
+                success = self._send_to_server(user_id, leak_info)
+                
+                # Уведомление админов для высокого риска
+                if success and leak_info.get('risk_score', 0) >= 50:
+                    self._send_alert(user_id, leak_info)
+            
+            logger.info(f"🔍 Утечка обнаружена: {leak_info['type']} (риск: {leak_info.get('risk_score')})")
+    
+    def run(self):
+        """Запуск бота"""
+        logger.info("🚀 Запуск Telegram Listener...")
+        
+        # Проверка конфигурации
+        if not RENDER_URL:
+            logger.warning("⚠️ RENDER_URL не установлен, серверные функции недоступны")
+        
+        self.updater.start_polling()
+        logger.info("✅ Telegram бот запущен и слушает сообщения")
+        self.updater.idle()
+
+# ========== ЗАПУСК ==========
+if __name__ == '__main__':
+    try:
+        listener = TelegramLeakListener()
+        listener.run()
+    except Exception as e:
+        logger.error(f"❌ Фатальная ошибка: {e}")
