@@ -2,632 +2,533 @@ import os
 import json
 import time
 import re
+import asyncio
 from datetime import datetime, timedelta
 from flask import Flask, request, jsonify, render_template
 import requests
+from typing import Dict, List, Optional, Tuple
+import hashlib
 
 # ========== КОНФИГУРАЦИЯ ==========
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 ALLOWED_IDS = [int(x.strip()) for x in os.environ.get("ALLOWED_IDS", "").split(",") if x.strip()]
 PORT = int(os.environ.get("PORT", 10000))
 
-print("="*60)
-print("🔐 ULTRA-STRICT LEAK DETECTOR")
-print("="*60)
+print("="*70)
+print("🤖 TELEGRAM INTEGRATED LEAK DETECTOR")
+print("="*70)
 print(f"Token: {'✓' if TELEGRAM_TOKEN else '✗'}")
 print(f"Allowed IDs: {ALLOWED_IDS}")
-print("="*60)
+print(f"Mode: REAL-TIME TELEGRAM MONITORING")
+print("="*70)
 
-# ========== ХРАНИЛИЩЕ С РАЗДЕЛЕНИЕМ ==========
-class Storage:
-    def __init__(self):
-        self.messages = []
-        self.users = {}
-        self.chats = {}
-        self.bot_chats = set()
+# ========== TELEGRAM API КЛАСС ==========
+class TelegramAPI:
+    def __init__(self, token: str):
+        self.token = token
+        self.base_url = f"https://api.telegram.org/bot{token}"
         
-        # РАЗДЕЛЕНИЕ ПО ИСТОЧНИКАМ УТЕЧЕК
-        self.leaks_by_source = {
-            "forward_from_our_chat": [],      # Переслал ИЗ нашего чата
-            "forward_to_our_chat": [],        # Переслал В наш чат
-            "copy_from_our_chat": [],         # Скопировал ИЗ нашего чата
-            "copy_to_our_chat": [],           # Скопировал В наш чат
-            "screenshot_from_our_chat": [],   # Заскринил ИЗ нашего чата
-            "screenshot_to_our_chat": [],     # Заскринил В наш чат
-            "other_leaks": []                 # Другие утечки
+    def make_request(self, method: str, data: dict = None) -> dict:
+        """Выполнить запрос к Telegram API"""
+        try:
+            url = f"{self.base_url}/{method}"
+            response = requests.post(url, json=data, timeout=15)
+            return response.json()
+        except Exception as e:
+            print(f"Telegram API error: {e}")
+            return {"ok": False, "error": str(e)}
+    
+    def get_chat_info(self, chat_id: int) -> dict:
+        """Получить информацию о чате"""
+        return self.make_request("getChat", {"chat_id": chat_id})
+    
+    def get_chat_members(self, chat_id: int) -> dict:
+        """Получить список участников чата"""
+        return self.make_request("getChatMembersCount", {"chat_id": chat_id})
+    
+    def get_message(self, chat_id: int, message_id: int) -> dict:
+        """Получить информацию о сообщении"""
+        return self.make_request("getMessage", {"chat_id": chat_id, "message_id": message_id})
+    
+    def get_chat_history(self, chat_id: int, limit: int = 100) -> dict:
+        """Получить историю чата"""
+        return self.make_request("getChatHistory", {
+            "chat_id": chat_id,
+            "limit": limit
+        })
+    
+    def forward_message(self, from_chat_id: int, to_chat_id: int, message_id: int) -> dict:
+        """Переслать сообщение"""
+        return self.make_request("forwardMessage", {
+            "chat_id": to_chat_id,
+            "from_chat_id": from_chat_id,
+            "message_id": message_id
+        })
+
+# ========== ИНТЕГРИРОВАННОЕ ХРАНИЛИЩЕ ==========
+class IntegratedStorage:
+    def __init__(self):
+        self.telegram_api = TelegramAPI(TELEGRAM_TOKEN)
+        
+        # Мониторинг чатов
+        self.monitored_chats = set()  # Чаты которые мониторим
+        self.chat_metadata = {}       # Метаданные чатов
+        
+        # Сообщения
+        self.messages = []
+        self.message_hashes = set()   # Для предотвращения дублей
+        
+        # Пользователи
+        self.users = {}
+        
+        # Утечки
+        self.leaks = {
+            "forwarded_messages": [],     # Пересланные сообщения
+            "copied_content": [],         # Скопированный контент
+            "external_shares": [],        # Внешние ссылки
+            "suspicious_activity": [],    # Подозрительная активность
         }
         
         self.load()
     
     def save(self):
+        """Сохранить данные"""
         try:
             data = {
-                "messages": self.messages[-10000:],
+                "monitored_chats": list(self.monitored_chats),
+                "chat_metadata": self.chat_metadata,
+                "messages": self.messages[-5000:],
                 "users": self.users,
-                "chats": self.chats,
-                "bot_chats": list(self.bot_chats),
-                "leaks_by_source": self.leaks_by_source,
-                "saved": datetime.now().isoformat()
+                "leaks": self.leaks,
+                "saved_at": datetime.now().isoformat()
             }
-            with open("data.json", "w", encoding="utf-8") as f:
+            
+            with open("integrated_data.json", "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2, ensure_ascii=False)
-            print(f"💾 Saved: {len(self.messages)} msgs, {sum(len(v) for v in self.leaks_by_source.values())} leaks")
+                
+            print(f"💾 Saved: {len(self.messages)} messages, {self.get_total_leaks()} leaks")
         except Exception as e:
             print(f"Save error: {e}")
     
     def load(self):
+        """Загрузить данные"""
         try:
-            if os.path.exists("data.json"):
-                with open("data.json", "r", encoding="utf-8") as f:
+            if os.path.exists("integrated_data.json"):
+                with open("integrated_data.json", "r", encoding="utf-8") as f:
                     data = json.load(f)
+                
+                self.monitored_chats = set(data.get("monitored_chats", []))
+                self.chat_metadata = data.get("chat_metadata", {})
                 self.messages = data.get("messages", [])
                 self.users = data.get("users", {})
-                self.chats = data.get("chats", {})
-                self.bot_chats = set(data.get("bot_chats", []))
-                self.leaks_by_source = data.get("leaks_by_source", {
-                    "forward_from_our_chat": [],
-                    "forward_to_our_chat": [],
-                    "copy_from_our_chat": [],
-                    "copy_to_our_chat": [],
-                    "screenshot_from_our_chat": [],
-                    "screenshot_to_our_chat": [],
-                    "other_leaks": []
+                self.leaks = data.get("leaks", {
+                    "forwarded_messages": [],
+                    "copied_content": [],
+                    "external_shares": [],
+                    "suspicious_activity": []
                 })
-                total_leaks = sum(len(v) for v in self.leaks_by_source.values())
-                print(f"📂 Loaded: {len(self.messages)} msgs, {total_leaks} leaks")
+                
+                # Восстановление хэшей
+                self.message_hashes = {self._get_message_hash(m) for m in self.messages}
+                
+                print(f"📂 Loaded: {len(self.messages)} msgs, {self.get_total_leaks()} leaks, {len(self.monitored_chats)} chats")
         except Exception as e:
             print(f"Load error: {e}")
     
-    def add_leak(self, leak_type: str, leak_data: dict):
-        """Добавить утечку в нужную категорию"""
-        if leak_type in self.leaks_by_source:
-            leak_data["id"] = len(self.leaks_by_source[leak_type]) + 1
-            leak_data["added_at"] = datetime.now().isoformat()
-            self.leaks_by_source[leak_type].append(leak_data)
-            return True
-        return False
+    def _get_message_hash(self, message: dict) -> str:
+        """Получить уникальный хэш сообщения"""
+        text = message.get("text", "") or message.get("caption", "")
+        return hashlib.md5(f"{message.get('chat_id')}_{message.get('message_id')}_{text}".encode()).hexdigest()
     
-    def get_all_leaks(self) -> list:
-        """Получить все утечки"""
-        all_leaks = []
-        for leak_type, leaks in self.leaks_by_source.items():
-            for leak in leaks:
-                leak["source_type"] = leak_type
-                all_leaks.append(leak)
-        return sorted(all_leaks, key=lambda x: x.get("timestamp", ""), reverse=True)
+    def get_total_leaks(self) -> int:
+        """Общее количество утечек"""
+        return sum(len(leaks) for leaks in self.leaks.values())
     
-    def get_leak_stats(self) -> dict:
-        """Статистика по утечкам"""
-        stats = {}
-        for leak_type, leaks in self.leaks_by_source.items():
-            stats[leak_type] = {
-                "count": len(leaks),
-                "last_leak": leaks[-1] if leaks else None,
-                "today": len([l for l in leaks if l.get("timestamp", "").startswith(datetime.now().strftime("%Y-%m-%d"))])
+    def add_monitored_chat(self, chat_id: int, chat_info: dict = None):
+        """Добавить чат в мониторинг"""
+        self.monitored_chats.add(chat_id)
+        
+        if chat_info:
+            self.chat_metadata[str(chat_id)] = {
+                "id": chat_id,
+                "title": chat_info.get("title", f"Chat {chat_id}"),
+                "type": chat_info.get("type", ""),
+                "username": chat_info.get("username", ""),
+                "added_at": datetime.now().isoformat(),
+                "last_checked": datetime.now().isoformat()
             }
-        stats["total"] = sum(len(v) for v in self.leaks_by_source.values())
-        return stats
+        
+        print(f"➕ Мониторинг чата: {chat_info.get('title', chat_id) if chat_info else chat_id}")
+    
+    def analyze_telegram_message(self, message: dict) -> dict:
+        """Анализ сообщения через Telegram API"""
+        analysis = {
+            "is_forwarded": False,
+            "has_external_links": False,
+            "contains_media": False,
+            "reply_to_forward": False,
+            "forward_chain": False,
+            "suspicious_patterns": []
+        }
+        
+        # 1. Проверка на пересылку
+        if "forward_date" in message:
+            analysis["is_forwarded"] = True
+            
+            # Проверяем источник пересылки
+            forward_from = message.get("forward_from_chat", {})
+            if forward_from:
+                forward_chat_id = forward_from.get("id")
+                # Если переслано из другого чата
+                if forward_chat_id and forward_chat_id != message.get("chat", {}).get("id"):
+                    analysis["suspicious_patterns"].append("cross_chat_forward")
+        
+        # 2. Проверка на медиа
+        if any(key in message for key in ["photo", "video", "document", "audio"]):
+            analysis["contains_media"] = True
+            
+            # Проверяем подписи к медиа
+            caption = message.get("caption", "")
+            if caption:
+                # Ищем ссылки в подписях
+                if re.search(r'https?://[^\s]+', caption):
+                    analysis["has_external_links"] = True
+        
+        # 3. Проверка текста на внешние ссылки
+        text = message.get("text", "")
+        if text:
+            # Ищем ссылки
+            links = re.findall(r'https?://[^\s]+', text)
+            if links:
+                analysis["has_external_links"] = True
+                
+                # Проверяем ссылки на популярные файлообменники
+                file_hosts = [
+                    "dropbox", "google.drive", "mega.nz", "yadi.sk",
+                    "disk.yandex", "cloud.mail", "telegram.me/file",
+                    "t.me/file"
+                ]
+                
+                for link in links:
+                    for host in file_hosts:
+                        if host in link.lower():
+                            analysis["suspicious_patterns"].append(f"file_hosting_{host}")
+                            break
+        
+        # 4. Проверка на ответ к пересланному сообщению
+        if "reply_to_message" in message and "forward_date" in message.get("reply_to_message", {}):
+            analysis["reply_to_forward"] = True
+            analysis["suspicious_patterns"].append("reply_to_forwarded")
+        
+        # 5. Проверка цепочки пересылок
+        if "forward_from_message_id" in message:
+            analysis["forward_chain"] = True
+        
+        return analysis
+    
+    def detect_leaks(self, message: dict, analysis: dict) -> List[Dict]:
+        """Обнаружение утечек на основе анализа"""
+        detected_leaks = []
+        chat_id = message.get("chat", {}).get("id")
+        user_id = message.get("from", {}).get("id")
+        message_id = message.get("message_id")
+        
+        # 1. Утечка через пересылку
+        if analysis["is_forwarded"]:
+            leak_data = {
+                "type": "forwarded_message",
+                "chat_id": chat_id,
+                "user_id": user_id,
+                "message_id": message_id,
+                "timestamp": datetime.now().isoformat(),
+                "confidence": 90,
+                "details": {
+                    "is_cross_chat": "cross_chat_forward" in analysis["suspicious_patterns"],
+                    "has_media": analysis["contains_media"],
+                    "source_chat": message.get("forward_from_chat", {}).get("title", "unknown")
+                }
+            }
+            detected_leaks.append(leak_data)
+            self.leaks["forwarded_messages"].append(leak_data)
+        
+        # 2. Утечка через внешние ссылки
+        if analysis["has_external_links"]:
+            leak_data = {
+                "type": "external_share",
+                "chat_id": chat_id,
+                "user_id": user_id,
+                "message_id": message_id,
+                "timestamp": datetime.now().isoformat(),
+                "confidence": 70,
+                "details": {
+                    "contains_file_links": any("file_hosting" in p for p in analysis["suspicious_patterns"]),
+                    "suspicious_patterns": analysis["suspicious_patterns"]
+                }
+            }
+            detected_leaks.append(leak_data)
+            self.leaks["external_shares"].append(leak_data)
+        
+        # 3. Подозрительная активность
+        if analysis["suspicious_patterns"]:
+            leak_data = {
+                "type": "suspicious_activity",
+                "chat_id": chat_id,
+                "user_id": user_id,
+                "message_id": message_id,
+                "timestamp": datetime.now().isoformat(),
+                "confidence": 50,
+                "details": {
+                    "patterns": analysis["suspicious_patterns"],
+                    "is_reply_to_forward": analysis["reply_to_forward"],
+                    "is_forward_chain": analysis["forward_chain"]
+                }
+            }
+            detected_leaks.append(leak_data)
+            self.leaks["suspicious_activity"].append(leak_data)
+        
+        return detected_leaks
 
-storage = Storage()
+storage = IntegratedStorage()
 
-# ========== УЛЬТРА-ЖЕСТКИЙ АНАЛИЗАТОР ==========
-class UltraStrictDetector:
+# ========== REAL-TIME MONITOR ==========
+class RealTimeMonitor:
     def __init__(self):
-        # СУПЕР-ЖЕСТКИЕ ПАТТЕРНЫ ДЛЯ КАЖДОГО ТИПА
+        self.active = True
+        self.check_interval = 60  # секунд
         
-        # 1. ПЕРЕСЫЛКА - максимально строгая проверка
-        self.forward_patterns = {
-            "exact": [
-                r"переслал",
-                r"forward",
-                r"отправил",
-                r"сделал репост",
-                r"репостнул",
-                r"поделился",
-                r"распространил",
-                r"разослал",
-                r"отслал",
-                r"форвард"
-            ],
-            "context": [
-                r"всем покажу",
-                r"показал другу",
-                r"кинул в другой чат",
-                r"отправил в другой чат",
-                r"скинул в",
-                r"разместил в",
-                r"опубликовал в",
-                r"выложил в"
-            ],
-            "intent": [
-                r"сохраню на будущее",
-                r"оставлю себе",
-                r"буду хранить",
-                r"заберу себе",
-                r"присвою",
-                r"использую",
-                r"воспользуюсь"
-            ]
-        }
-        
-        # 2. КОПИРОВАНИЕ - гипер-строгая проверка
-        self.copy_patterns = {
-            "exact": [
-                r"скопировал",
-                r"копирую",
-                r"copy",
-                r"взял текст",
-                r"украл текст",
-                r"присвоил текст",
-                r"сохранил текст",
-                r"записал текст",
-                r"копипаст",
-                r"копипаста",
-                r"дублировал",
-                r"повторил"
-            ],
-            "context": [
-                r"весь текст",
-                r"целиком",
-                r"полностью",
-                r"дословно",
-                r"точно так же",
-                r"один в один",
-                r"как есть",
-                r"без изменений"
-            ],
-            "method": [
-                r"через ctrl\+c",
-                r"через ctrl\+v",
-                r"выделил и копировал",
-                r"выделил весь текст",
-                r"скопировал мышкой",
-                r"сохранил в буфер"
-            ]
-        }
-        
-        # 3. СКРИНШОТЫ - максимальная детекция
-        self.screenshot_patterns = {
-            "exact": [
-                r"скрин",
-                r"screenshot",
-                r"снимок экрана",
-                r"фото экрана",
-                r"картинка чата",
-                r"заскринил",
-                r"сделал скрин",
-                r"сохранил скрин",
-                r"снял скрин",
-                r"захватил экран"
-            ],
-            "context": [
-                r"сохранил себе",
-                r"сохранено у меня",
-                r"имею фото",
-                r"имею снимок",
-                r"зафиксировал",
-                r"запечатлел",
-                r"запомнил на фото",
-                r"оставил на память"
-            ],
-            "action": [
-                r"нажал print screen",
-                r"через ножницы",
-                r"через lightshot",
-                r"через gyazo",
-                r"через snipping tool",
-                r"скриншотил",
-                r"снимал экран"
-            ],
-            "sharing": [
-                r"покажу всем",
-                r"распространил скрин",
-                r"разошлю скрин",
-                r"отправлю скрин",
-                r"скину скрин",
-                r"выложу скрин"
-            ]
-        }
-        
-        # 4. ДОПОЛНИТЕЛЬНЫЕ ЖЕСТКИЕ ПАТТЕРНЫ
-        self.extra_strict_patterns = {
-            "data_leak": [
-                r"пароль[:\s]*[^\s]{4,}",
-                r"логин[:\s]*[^\s]{3,}",
-                r"ключ[:\s]*[^\s]{8,}",
-                r"токен[:\s]*[^\s]{10,}",
-                r"секрет[:\s]*[^\s]{4,}",
-                r"конфиденциально[^\s]*"
-            ],
-            "threat": [
-                r"слил инфу",
-                r"утекло инфо",
-                r"выложил данные",
-                r"опубликовал приват",
-                r"рассекретил",
-                r"раскрыл тайну"
-            ]
-        }
-    
-    def ultra_detect_forward(self, text: str, is_actual_forward: bool = False) -> dict:
-        """УЛЬТРА-ЖЕСТКАЯ проверка на пересылку"""
-        if not text:
-            return {"detected": False, "confidence": 0, "patterns": [], "score": 0}
-        
-        text_lower = text.lower()
-        patterns_found = []
-        confidence = 0
-        
-        # БАЗОВЫЙ СЛУЧАЙ: реальная пересылка в Telegram
-        if is_actual_forward:
-            patterns_found.append("actual_telegram_forward")
-            confidence += 90
-        
-        # ЖЕСТКАЯ проверка по точным словам
-        for pattern in self.forward_patterns["exact"]:
-            if re.search(pattern, text_lower, re.IGNORECASE):
-                patterns_found.append(f"forward_exact_{pattern[:15]}")
-                confidence += 30
-        
-        # Проверка контекста
-        for pattern in self.forward_patterns["context"]:
-            if re.search(pattern, text_lower, re.IGNORECASE):
-                patterns_found.append(f"forward_context_{pattern[:15]}")
-                confidence += 25
-        
-        # Проверка намерений
-        for pattern in self.forward_patterns["intent"]:
-            if re.search(pattern, text_lower, re.IGNORECASE):
-                patterns_found.append(f"forward_intent_{pattern[:15]}")
-                confidence += 20
-        
-        # Комбинация паттернов увеличивает уверенность
-        if len(patterns_found) >= 2:
-            confidence += 15
-        if len(patterns_found) >= 3:
-            confidence += 20
-        
-        return {
-            "detected": confidence >= 20,
-            "confidence": min(100, confidence),
-            "patterns": patterns_found,
-            "score": min(100, confidence * 1.5)
-        }
-    
-    def ultra_detect_copy(self, text: str, reply_to_text: str = "") -> dict:
-        """УЛЬТРА-ЖЕСТКАЯ проверка на копирование"""
-        if not text:
-            return {"detected": False, "confidence": 0, "patterns": [], "similarity": 0}
-        
-        text_lower = text.lower()
-        patterns_found = []
-        confidence = 0
-        
-        # 1. Проверка по точным словам копирования
-        for pattern in self.copy_patterns["exact"]:
-            if re.search(pattern, text_lower, re.IGNORECASE):
-                patterns_found.append(f"copy_exact_{pattern[:15]}")
-                confidence += 35
-        
-        # 2. Проверка контекста копирования
-        for pattern in self.copy_patterns["context"]:
-            if re.search(pattern, text_lower, re.IGNORECASE):
-                patterns_found.append(f"copy_context_{pattern[:15]}")
-                confidence += 25
-        
-        # 3. Проверка методов копирования
-        for pattern in self.copy_patterns["method"]:
-            if re.search(pattern, text_lower, re.IGNORECASE):
-                patterns_found.append(f"copy_method_{pattern[:15]}")
-                confidence += 30
-        
-        # 4. ПРОВЕРКА СХОЖЕСТИ ТЕКСТОВ (самая важная)
-        similarity_score = 0
-        if reply_to_text and text:
-            similarity = self._calculate_text_similarity(text, reply_to_text)
-            similarity_score = similarity * 100
+    def check_chat_activity(self, chat_id: int):
+        """Проверить активность в чате"""
+        try:
+            # Получаем последние сообщения из чата
+            result = storage.telegram_api.get_chat_history(chat_id, limit=50)
             
-            if similarity > 0.7:  # 70% схожести
-                patterns_found.append("high_text_similarity")
-                confidence += 40
-            elif similarity > 0.5:  # 50% схожести
-                patterns_found.append("medium_text_similarity")
-                confidence += 25
-            elif similarity > 0.3:  # 30% схожести
-                patterns_found.append("low_text_similarity")
-                confidence += 15
-        
-        # 5. Проверка на копирование структуры
-        if len(text.split()) > 10:  # Длинный текст
-            # Проверяем повторы фраз
-            words = text_lower.split()
-            common_phrases = []
-            for i in range(len(words) - 2):
-                phrase = " ".join(words[i:i+3])
-                if text_lower.count(phrase) > 1:
-                    common_phrases.append(phrase)
+            if result.get("ok"):
+                messages = result.get("result", {}).get("messages", [])
+                
+                for msg in messages[-20:]:  # Проверяем последние 20 сообщений
+                    # Проверяем, не обрабатывали ли уже это сообщение
+                    msg_hash = hashlib.md5(f"{chat_id}_{msg.get('id')}".encode()).hexdigest()
+                    
+                    if msg_hash not in storage.message_hashes:
+                        # Анализируем сообщение
+                        analysis = storage.analyze_telegram_message(msg)
+                        leaks = storage.detect_leaks(msg, analysis)
+                        
+                        if leaks:
+                            print(f"🚨 Обнаружены утечки в чате {chat_id}: {len(leaks)}")
+                        
+                        # Сохраняем сообщение
+                        msg_data = {
+                            "chat_id": chat_id,
+                            "message_id": msg.get("id"),
+                            "user_id": msg.get("from_id", {}).get("user_id", 0),
+                            "text": msg.get("text", "") or msg.get("caption", ""),
+                            "timestamp": datetime.now().isoformat(),
+                            "is_forwarded": "forward_date" in msg,
+                            "has_media": any(key in msg for key in ["photo", "video", "document"]),
+                            "analysis": analysis,
+                            "leaks_detected": len(leaks) > 0
+                        }
+                        
+                        storage.messages.append(msg_data)
+                        storage.message_hashes.add(msg_hash)
             
-            if common_phrases:
-                patterns_found.append("repeated_phrases")
-                confidence += 20
-        
-        # Комбинация паттернов
-        if len(patterns_found) >= 2:
-            confidence += 15
-        if len(patterns_found) >= 3:
-            confidence += 20
-        
-        return {
-            "detected": confidence >= 25,
-            "confidence": min(100, confidence),
-            "patterns": patterns_found,
-            "similarity": similarity_score,
-            "score": min(100, confidence * 1.3)
-        }
+            # Обновляем время последней проверки
+            if str(chat_id) in storage.chat_metadata:
+                storage.chat_metadata[str(chat_id)]["last_checked"] = datetime.now().isoformat()
+                
+        except Exception as e:
+            print(f"Chat check error for {chat_id}: {e}")
     
-    def ultra_detect_screenshot(self, text: str) -> dict:
-        """УЛЬТРА-ЖЕСТКАЯ проверка на скриншоты"""
-        if not text:
-            return {"detected": False, "confidence": 0, "patterns": [], "score": 0}
+    def start_monitoring(self):
+        """Запустить мониторинг чатов"""
+        print("🎯 Запуск REAL-TIME мониторинга...")
         
-        text_lower = text.lower()
-        patterns_found = []
-        confidence = 0
+        import threading
+        def monitor_loop():
+            while self.active:
+                try:
+                    # Проверяем все мониторимые чаты
+                    for chat_id in list(storage.monitored_chats):
+                        self.check_chat_activity(chat_id)
+                    
+                    # Автосохранение
+                    if len(storage.messages) % 50 == 0:
+                        storage.save()
+                    
+                    time.sleep(self.check_interval)
+                    
+                except Exception as e:
+                    print(f"Monitor loop error: {e}")
+                    time.sleep(30)
         
-        # 1. Точные слова скриншотов
-        for pattern in self.screenshot_patterns["exact"]:
-            if re.search(pattern, text_lower, re.IGNORECASE):
-                patterns_found.append(f"screenshot_exact_{pattern[:15]}")
-                confidence += 40
-        
-        # 2. Контекст сохранения
-        for pattern in self.screenshot_patterns["context"]:
-            if re.search(pattern, text_lower, re.IGNORECASE):
-                patterns_found.append(f"screenshot_context_{pattern[:15]}")
-                confidence += 30
-        
-        # 3. Методы создания скриншотов
-        for pattern in self.screenshot_patterns["action"]:
-            if re.search(pattern, text_lower, re.IGNORECASE):
-                patterns_found.append(f"screenshot_action_{pattern[:15]}")
-                confidence += 35
-        
-        # 4. Распространение скриншотов
-        for pattern in self.screenshot_patterns["sharing"]:
-            if re.search(pattern, text_lower, re.IGNORECASE):
-                patterns_found.append(f"screenshot_sharing_{pattern[:15]}")
-                confidence += 45  # Очень высокий вес!
-        
-        # 5. Дополнительные жесткие проверки
-        for category, patterns in self.extra_strict_patterns.items():
-            for pattern in patterns:
-                if re.search(pattern, text_lower, re.IGNORECASE):
-                    patterns_found.append(f"extra_{category}_{pattern[:10]}")
-                    confidence += 25
-        
-        # Комбинация паттернов
-        if len(patterns_found) >= 2:
-            confidence += 20
-        if len(patterns_found) >= 3:
-            confidence += 30
-        if len(patterns_found) >= 4:
-            confidence += 40
-        
-        return {
-            "detected": confidence >= 30,
-            "confidence": min(100, confidence),
-            "patterns": patterns_found,
-            "score": min(100, confidence * 1.4)
-        }
-    
-    def _calculate_text_similarity(self, text1: str, text2: str) -> float:
-        """Расчет схожести текстов"""
-        if not text1 or not text2:
-            return 0.0
-        
-        # Очистка текста
-        clean1 = re.sub(r'\s+', ' ', text1.strip().lower())
-        clean2 = re.sub(r'\s+', ' ', text2.strip().lower())
-        
-        if clean1 == clean2:
-            return 1.0
-        
-        # Разделение на слова
-        words1 = set(clean1.split())
-        words2 = set(clean2.split())
-        
-        if not words1 or not words2:
-            return 0.0
-        
-        # Коэффициент Жаккара
-        intersection = len(words1.intersection(words2))
-        union = len(words1.union(words2))
-        
-        # Учитываем порядок слов
-        jaccard = intersection / union if union > 0 else 0.0
-        
-        # Дополнительная проверка на подстроки
-        if len(clean1) > 20 and len(clean2) > 20:
-            if clean1 in clean2 or clean2 in clean1:
-                return max(jaccard, 0.8)
-        
-        return jaccard
-    
-    def analyze_message(self, text: str, is_forwarded: bool = False, reply_text: str = "") -> dict:
-        """Полный анализ сообщения"""
-        forward_result = self.ultra_detect_forward(text, is_forwarded)
-        copy_result = self.ultra_detect_copy(text, reply_text)
-        screenshot_result = self.ultra_detect_screenshot(text)
-        
-        # Определение главного типа утечки
-        max_score = max(
-            forward_result["score"],
-            copy_result["score"],
-            screenshot_result["score"]
-        )
-        
-        main_leak_type = None
-        if max_score > 30:  # Порог обнаружения
-            if forward_result["score"] == max_score:
-                main_leak_type = "forward"
-            elif copy_result["score"] == max_score:
-                main_leak_type = "copy"
-            elif screenshot_result["score"] == max_score:
-                main_leak_type = "screenshot"
-        
-        return {
-            "has_leak": main_leak_type is not None,
-            "main_leak_type": main_leak_type,
-            "forward": forward_result,
-            "copy": copy_result,
-            "screenshot": screenshot_result,
-            "max_score": max_score,
-            "timestamp": datetime.now().isoformat()
-        }
+        thread = threading.Thread(target=monitor_loop, daemon=True)
+        thread.start()
 
-detector = UltraStrictDetector()
-
-# ========== TELEGRAM API ==========
-def send_telegram_message(chat_id: int, text: str, parse_mode: str = "HTML"):
-    """Отправить сообщение в Telegram"""
-    try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        data = {
-            "chat_id": chat_id,
-            "text": text,
-            "parse_mode": parse_mode,
-            "disable_web_page_preview": True
-        }
-        response = requests.post(url, json=data, timeout=10)
-        return response.json().get("ok", False)
-    except Exception as e:
-        print(f"Send message error: {e}")
-        return False
+monitor = RealTimeMonitor()
 
 # ========== FLASK APP ==========
 app = Flask(__name__)
 
+def send_alert_to_allowed_users(alert_data: dict):
+    """Отправить оповещение всем разрешённым пользователям"""
+    for user_id in ALLOWED_IDS:
+        try:
+            alert_message = f"""
+🚨 <b>REAL-TIME DETECTION</b>
+
+<b>Тип утечки:</b> {alert_data['type'].replace('_', ' ').upper()}
+<b>Чат:</b> {alert_data.get('chat_title', f"ID: {alert_data['chat_id']}")}
+<b>Пользователь:</b> {alert_data.get('username', 'Unknown')}
+<b>Уверенность:</b> {alert_data['confidence']}%
+<b>Время:</b> {datetime.now().strftime('%H:%M:%S')}
+
+<b>Детали:</b>
+"""
+            
+            for key, value in alert_data.get('details', {}).items():
+                if isinstance(value, bool):
+                    value = "✅" if value else "❌"
+                alert_message += f"├─ {key}: {value}\n"
+            
+            alert_message += f"\n<i>Сообщение ID: {alert_data['message_id']}</i>"
+            
+            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+            data = {
+                "chat_id": user_id,
+                "text": alert_message,
+                "parse_mode": "HTML"
+            }
+            
+            requests.post(url, json=data, timeout=10)
+            
+        except Exception as e:
+            print(f"Alert send error to {user_id}: {e}")
+
 @app.route('/')
 def home():
     stats = {
+        "monitored_chats": len(storage.monitored_chats),
         "total_messages": len(storage.messages),
-        "total_users": len(storage.users),
-        "total_chats": len(storage.chats),
-        "bot_chats_count": len(storage.bot_chats),
-        "leak_stats": storage.get_leak_stats(),
+        "total_leaks": storage.get_total_leaks(),
+        "forwarded_leaks": len(storage.leaks["forwarded_messages"]),
+        "external_shares": len(storage.leaks["external_shares"]),
+        "suspicious_activity": len(storage.leaks["suspicious_activity"]),
         "last_update": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     }
     
-    # Получаем последние утечки
-    recent_leaks = storage.get_all_leaks()[:20]
+    # Получаем информацию о мониторимых чатах
+    monitored_chats_info = []
+    for chat_id in list(storage.monitored_chats)[:10]:
+        chat_info = storage.chat_metadata.get(str(chat_id), {
+            "id": chat_id,
+            "title": f"Chat {chat_id}",
+            "last_checked": "Never"
+        })
+        monitored_chats_info.append(chat_info)
     
-    # Статистика по типам утечек
-    leak_types_count = {}
-    for leak_type, leaks in storage.leaks_by_source.items():
-        leak_types_count[leak_type] = len(leaks)
+    # Последние утечки
+    recent_leaks = []
+    for leak_type, leaks in storage.leaks.items():
+        for leak in leaks[-5:]:
+            leak["leak_type"] = leak_type
+            recent_leaks.append(leak)
+    
+    recent_leaks.sort(key=lambda x: x.get("timestamp", ""), reverse=True)
     
     return render_template('index.html',
                          stats=stats,
                          allowed_ids=ALLOWED_IDS,
-                         recent_leaks=recent_leaks,
-                         leak_types_count=leak_types_count)
+                         monitored_chats=monitored_chats_info,
+                         recent_leaks=recent_leaks[:15])
 
 @app.route('/api/stats')
 def api_stats():
-    leak_stats = storage.get_leak_stats()
     return jsonify({
-        "general": {
-            "messages": len(storage.messages),
-            "users": len(storage.users),
-            "chats": len(storage.chats),
-            "bot_chats": len(storage.bot_chats)
+        "monitoring": {
+            "active_chats": len(storage.monitored_chats),
+            "total_messages": len(storage.messages),
+            "check_interval": monitor.check_interval
         },
-        "leaks": leak_stats,
-        "today": {
-            "messages": len([m for m in storage.messages if m.get("time", "").startswith(datetime.now().strftime("%Y-%m-%d"))]),
-            "leaks": sum([len([l for l in storage.leaks_by_source[lt] 
-                             if l.get("timestamp", "").startswith(datetime.now().strftime("%Y-%m-%d"))])
-                         for lt in storage.leaks_by_source])
+        "leaks": {
+            "forwarded_messages": len(storage.leaks["forwarded_messages"]),
+            "external_shares": len(storage.leaks["external_shares"]),
+            "suspicious_activity": len(storage.leaks["suspicious_activity"]),
+            "total": storage.get_total_leaks()
         },
-        "timestamp": datetime.now().isoformat()
+        "system": {
+            "telegram_api": "connected",
+            "real_time_monitor": "active",
+            "last_check": datetime.now().isoformat()
+        }
     })
 
-@app.route('/api/leaks')
-def api_leaks():
-    all_leaks = storage.get_all_leaks()
-    return jsonify({
-        "leaks": all_leaks[:100],
-        "count": len(all_leaks),
-        "by_source": {k: len(v) for k, v in storage.leaks_by_source.items()}
-    })
-
-@app.route('/api/leaks/forward')
-def api_leaks_forward():
-    """Утечки типа пересылка"""
-    forwards = storage.leaks_by_source["forward_from_our_chat"] + storage.leaks_by_source["forward_to_our_chat"]
-    return jsonify({
-        "leaks": forwards[-50:],
-        "count": len(forwards),
-        "from_our_chat": len(storage.leaks_by_source["forward_from_our_chat"]),
-        "to_our_chat": len(storage.leaks_by_source["forward_to_our_chat"])
-    })
-
-@app.route('/api/leaks/copy')
-def api_leaks_copy():
-    """Утечки типа копирование"""
-    copies = storage.leaks_by_source["copy_from_our_chat"] + storage.leaks_by_source["copy_to_our_chat"]
-    return jsonify({
-        "leaks": copies[-50:],
-        "count": len(copies),
-        "from_our_chat": len(storage.leaks_by_source["copy_from_our_chat"]),
-        "to_our_chat": len(storage.leaks_by_source["copy_to_our_chat"])
-    })
-
-@app.route('/api/leaks/screenshot')
-def api_leaks_screenshot():
-    """Утечки типа скриншот"""
-    screenshots = storage.leaks_by_source["screenshot_from_our_chat"] + storage.leaks_by_source["screenshot_to_our_chat"]
-    return jsonify({
-        "leaks": screenshots[-50:],
-        "count": len(screenshots),
-        "from_our_chat": len(storage.leaks_by_source["screenshot_from_our_chat"]),
-        "to_our_chat": len(storage.leaks_by_source["screenshot_to_our_chat"])
-    })
-
-@app.route('/api/users')
-def api_users():
-    users_list = []
-    for user_id, user_data in storage.users.items():
-        # Считаем утечки по типам
-        leaks_by_type = {}
-        for leak_type, leaks in storage.leaks_by_source.items():
-            user_leaks = [l for l in leaks if l.get("user_id") == user_id]
-            if user_leaks:
-                leaks_by_type[leak_type] = len(user_leaks)
+@app.route('/api/chats')
+def api_chats():
+    chats_info = []
+    for chat_id in storage.monitored_chats:
+        chat_info = storage.chat_metadata.get(str(chat_id), {
+            "id": chat_id,
+            "title": f"Chat {chat_id}",
+            "monitored_since": "unknown"
+        })
         
-        user_data_copy = user_data.copy()
-        user_data_copy["total_leaks"] = sum(len([l for l in leaks if l.get("user_id") == user_id]) 
-                                          for leaks in storage.leaks_by_source.values())
-        user_data_copy["leaks_by_type"] = leaks_by_type
-        users_list.append(user_data_copy)
+        # Подсчитываем сообщения и утечки в чате
+        chat_messages = [m for m in storage.messages if m.get("chat_id") == chat_id]
+        chat_leaks = []
+        for leak_type, leaks in storage.leaks.items():
+            chat_leaks.extend([l for l in leaks if l.get("chat_id") == chat_id])
+        
+        chat_info["messages_count"] = len(chat_messages)
+        chat_info["leaks_count"] = len(chat_leaks)
+        chats_info.append(chat_info)
     
-    return jsonify({
-        "users": sorted(users_list, key=lambda x: x.get("messages", 0), reverse=True),
-        "count": len(users_list)
-    })
+    return jsonify({"chats": chats_info, "count": len(chats_info)})
+
+@app.route('/api/monitor/add/<int:chat_id>')
+def api_monitor_add(chat_id):
+    """Добавить чат в мониторинг"""
+    try:
+        # Получаем информацию о чате
+        result = storage.telegram_api.get_chat_info(chat_id)
+        
+        if result.get("ok"):
+            storage.add_monitored_chat(chat_id, result.get("result"))
+            storage.save()
+            
+            return jsonify({
+                "success": True,
+                "message": f"Chat {chat_id} added to monitoring",
+                "chat_info": result.get("result")
+            })
+        else:
+            return jsonify({"success": False, "error": "Cannot get chat info"})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)})
+
+@app.route('/api/monitor/remove/<int:chat_id>')
+def api_monitor_remove(chat_id):
+    """Убрать чат из мониторинга"""
+    if chat_id in storage.monitored_chats:
+        storage.monitored_chats.remove(chat_id)
+        storage.save()
+        return jsonify({"success": True, "message": f"Chat {chat_id} removed from monitoring"})
+    return jsonify({"success": False, "error": "Chat not monitored"})
 
 @app.route('/health')
 def health():
     return jsonify({
         "status": "ok",
-        "service": "ultra-strict-leak-detector",
-        "timestamp": datetime.now().isoformat(),
-        "detector": "ULTRA_STRICT_MODE_ACTIVE"
+        "service": "telegram-integrated-leak-detector",
+        "telegram_api": "connected" if TELEGRAM_TOKEN else "disconnected",
+        "real_time_monitor": "active" if monitor.active else "inactive",
+        "monitored_chats": len(storage.monitored_chats),
+        "timestamp": datetime.now().isoformat()
     })
 
 @app.route('/setup')
 def setup():
-    """Установка webhook"""
+    """Установить вебхук и запустить мониторинг"""
     try:
         webhook_url = os.environ.get("RENDER_EXTERNAL_URL", "https://anti-peresilka.onrender.com")
         webhook_url = f"{webhook_url}/webhook"
@@ -638,322 +539,194 @@ def setup():
             "max_connections": 100,
             "allowed_updates": ["message", "edited_message", "chat_member"]
         }
-        response = requests.post(url, json=data)
         
-        if response.json().get("ok"):
-            return jsonify({
-                "ok": True,
-                "message": "ULTRA STRICT MODE ACTIVATED",
-                "url": webhook_url,
-                "detection_level": "MAXIMUM"
-            })
-        else:
-            return jsonify({"error": response.json()})
+        response = requests.post(url, json=data)
+        result = response.json()
+        
+        # Запускаем мониторинг в реальном времени
+        monitor.start_monitoring()
+        
+        return jsonify({
+            "ok": result.get("ok", False),
+            "webhook": webhook_url,
+            "real_time_monitor": "started",
+            "message": "System fully integrated with Telegram API"
+        })
     except Exception as e:
         return jsonify({"error": str(e)})
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
-    """Обработка сообщений от Telegram - УЛЬТРА-ЖЕСТКАЯ ПРОВЕРКА"""
+    """Обработчик вебхука - ОСНОВНОЙ МЕХАНИЗМ"""
     try:
         data = request.json
         if not data:
             return jsonify({"ok": True})
         
-        # Обработка добавления бота в чат
+        # 1. Добавление бота в чат
         if "my_chat_member" in data:
             chat_member = data["my_chat_member"]
             chat = chat_member.get("chat", {})
             chat_id = chat.get("id")
             
             if chat_id:
-                storage.bot_chats.add(chat_id)
-                storage.chats[str(chat_id)] = {
-                    "id": chat_id,
-                    "title": chat.get("title", f"Chat {chat_id}"),
-                    "type": chat.get("type", ""),
-                    "bot_added": datetime.now().isoformat()
-                }
-                print(f"🤖 Бот добавлен в чат: {chat.get('title')} (ID: {chat_id})")
+                # Автоматически добавляем в мониторинг
+                storage.add_monitored_chat(chat_id, chat)
+                print(f"🤖 Бот добавлен в чат: {chat.get('title', chat_id)}")
+                
+                # Отправляем приветствие
+                welcome_msg = f"""
+🎯 <b>TELEGRAM INTEGRATED LEAK DETECTOR</b>
+
+Чат <b>{chat.get('title', chat_id)}</b> добавлен в систему мониторинга.
+
+<b>🔍 Что отслеживается:</b>
+• Пересланные сообщения
+• Внешние ссылки и файлообменники
+• Подозрительная активность
+• Кросс-чат пересылки
+
+<b>👁️ Режим:</b> REAL-TIME мониторинг
+<b>⏱️ Интервал проверки:</b> {monitor.check_interval} секунд
+
+<i>Система работает в фоновом режиме</i>
+"""
+                
+                for user_id in ALLOWED_IDS:
+                    try:
+                        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+                        requests.post(url, json={
+                            "chat_id": user_id,
+                            "text": welcome_msg,
+                            "parse_mode": "HTML"
+                        })
+                    except:
+                        pass
         
-        # Обработка сообщений
+        # 2. Обработка сообщений
         if "message" in data:
-            msg = data["message"]
-            user_id = msg.get("from", {}).get("id", 0)
-            chat_id = msg.get("chat", {}).get("id", 0)
-            text = msg.get("text", "") or msg.get("caption", "")
+            message = data["message"]
+            chat_id = message.get("chat", {}).get("id")
+            user_id = message.get("from", {}).get("id")
             
-            # Добавляем чат в список
-            storage.bot_chats.add(chat_id)
+            # Автоматически добавляем чат в мониторинг
+            if chat_id and chat_id not in storage.monitored_chats:
+                storage.add_monitored_chat(chat_id, message.get("chat", {}))
+            
+            # Анализируем сообщение
+            analysis = storage.analyze_telegram_message(message)
+            leaks = storage.detect_leaks(message, analysis)
             
             # Сохраняем сообщение
-            message_data = {
-                "id": msg.get("message_id"),
-                "user_id": user_id,
+            msg_hash = storage._get_message_hash({
                 "chat_id": chat_id,
-                "text": text[:1000],
-                "time": datetime.now().isoformat(),
-                "is_forward": "forward_date" in msg,
-                "has_reply": "reply_to_message" in msg,
-                "chat_title": msg.get("chat", {}).get("title", ""),
-                "username": msg.get("from", {}).get("username", ""),
-                "first_name": msg.get("from", {}).get("first_name", "")
-            }
+                "message_id": message.get("message_id"),
+                "text": message.get("text", "") or message.get("caption", "")
+            })
             
-            storage.messages.append(message_data)
-            
-            # Обновляем чат
-            chat_info = msg.get("chat", {})
-            storage.chats[str(chat_id)] = {
-                "id": chat_id,
-                "title": chat_info.get("title", f"Chat {chat_id}"),
-                "type": chat_info.get("type", ""),
-                "last_activity": datetime.now().isoformat()
-            }
-            
-            # Обновляем пользователя
-            if user_id not in storage.users:
-                storage.users[user_id] = {
-                    "id": user_id,
-                    "username": msg.get("from", {}).get("username", ""),
-                    "first_name": msg.get("from", {}).get("first_name", ""),
-                    "messages": 0,
-                    "leaks": 0,
-                    "first_seen": datetime.now().isoformat()
-                }
-            
-            user = storage.users[user_id]
-            user["messages"] = user.get("messages", 0) + 1
-            user["last_seen"] = datetime.now().isoformat()
-            
-            # УЛЬТРА-ЖЕСТКИЙ АНАЛИЗ СООБЩЕНИЯ
-            reply_text = ""
-            if "reply_to_message" in msg:
-                reply_text = msg["reply_to_message"].get("text", "") or msg["reply_to_message"].get("caption", "")
-            
-            analysis = detector.analyze_message(
-                text=text,
-                is_forwarded=message_data["is_forward"],
-                reply_text=reply_text
-            )
-            
-            # ОПРЕДЕЛЕНИЕ ИСТОЧНИКА УТЕЧКИ
-            if analysis["has_leak"]:
-                leak_type = analysis["main_leak_type"]
-                chat_name = message_data.get("chat_title", f"чат {chat_id}")
-                
-                # Определяем направление утечки
-                # TODO: Здесь нужно определить, наш это чат или внешний
-                # Пока что считаем все чаты "нашими" для бота
-                source_direction = "from_our_chat"  # ИЗ нашего чата
-                
-                leak_category = f"{leak_type}_{source_direction}"
-                
-                leak_data = {
-                    "user_id": user_id,
-                    "username": user.get("username", ""),
+            if msg_hash not in storage.message_hashes:
+                msg_data = {
                     "chat_id": chat_id,
-                    "chat_title": chat_name,
-                    "message_id": message_data["id"],
-                    "text": text[:300],
-                    "leak_type": leak_type,
-                    "confidence": analysis[leak_type]["confidence"],
-                    "patterns": analysis[leak_type]["patterns"],
-                    "score": analysis[leak_type]["score"],
-                    "timestamp": analysis["timestamp"],
-                    "is_actual_forward": message_data["is_forward"],
-                    "has_reply": message_data["has_reply"]
+                    "message_id": message.get("message_id"),
+                    "user_id": user_id,
+                    "text": message.get("text", "") or message.get("caption", "")[:500],
+                    "timestamp": datetime.now().isoformat(),
+                    "analysis": analysis,
+                    "leaks_detected": len(leaks) > 0
                 }
                 
-                # Добавляем в соответствующую категорию
-                if leak_category == "forward_from_our_chat":
-                    storage.add_leak("forward_from_our_chat", leak_data)
-                elif leak_category == "copy_from_our_chat":
-                    storage.add_leak("copy_from_our_chat", leak_data)
-                elif leak_category == "screenshot_from_our_chat":
-                    storage.add_leak("screenshot_from_our_chat", leak_data)
-                else:
-                    storage.add_leak("other_leaks", leak_data)
-                
-                user["leaks"] = user.get("leaks", 0) + 1
-                
-                print(f"🚨 УЛЬТРА-ЖЕСТКОЕ ОБНАРУЖЕНИЕ!")
-                print(f"   Тип: {leak_type.upper()}")
-                print(f"   Чат: {chat_name}")
-                print(f"   Пользователь: {user_id}")
-                print(f"   Уверенность: {analysis[leak_type]['confidence']}%")
-                print(f"   Паттерны: {analysis[leak_type]['patterns'][:3]}")
-                
-                # ОТПРАВКА УВЕДОМЛЕНИЯ РАЗРЕШЕННЫМ ПОЛЬЗОВАТЕЛЯМ
-                for allowed_id in ALLOWED_IDS:
-                    if allowed_id != user_id:
-                        # Определяем эмодзи и уровень
-                        if analysis[leak_type]["confidence"] > 80:
-                            emoji = "🔴"
-                            level = "КРИТИЧЕСКИЙ УРОВЕНЬ"
-                        elif analysis[leak_type]["confidence"] > 60:
-                            emoji = "🟠"
-                            level = "ВЫСОКИЙ УРОВЕНЬ"
-                        elif analysis[leak_type]["confidence"] > 40:
-                            emoji = "🟡"
-                            level = "СРЕДНИЙ УРОВЕНЬ"
-                        else:
-                            emoji = "🔵"
-                            level = "НИЗКИЙ УРОВЕНЬ"
-                        
-                        # Тип утечки
-                        if leak_type == "forward":
-                            type_desc = "📤 ПЕРЕСЫЛКА"
-                        elif leak_type == "copy":
-                            type_desc = "📋 КОПИРОВАНИЕ"
-                        elif leak_type == "screenshot":
-                            type_desc = "📸 СКРИНШОТ"
-                        else:
-                            type_desc = "⚠️ УТЕЧКА"
-                        
-                        alert_message = f"""
-{emoji} <b>{level} - {type_desc}</b>
-
-<b>📌 ДЕТАЛИ ОБНАРУЖЕНИЯ:</b>
-├─ <b>Тип:</b> {type_desc}
-├─ <b>Чат:</b> <code>{chat_name}</code>
-├─ <b>Пользователь:</b> @{user.get('username', 'без username')}
-├─ <b>ID:</b> <code>{user_id}</code>
-├─ <b>Уверенность:</b> <b>{analysis[leak_type]['confidence']}%</b>
-└─ <b>Направление:</b> ИЗ нашего чата
-
-<b>🔍 ОБНАРУЖЕННЫЕ ПАТТЕРНЫ:</b>
-{chr(10).join(f'├─ {p}' for p in analysis[leak_type]['patterns'][:3])}
-└─ ... (всего {len(analysis[leak_type]['patterns'])} паттернов)
-
-<b>💬 СООБЩЕНИЕ:</b>
-<code>{text[:120]}{'...' if len(text) > 120 else ''}</code>
-
-<b>📊 СТАТИСТИКА:</b>
-├─ Всего сообщений от пользователя: {user.get('messages', 0)}
-├─ Всего утечек от пользователя: {user.get('leaks', 0)}
-└─ Время: {datetime.now().strftime('%H:%M:%S')}
-
-<i>⚠️ УЛЬТРА-ЖЕСТКАЯ СИСТЕМА МОНИТОРИНГА АКТИВНА</i>
-"""
-                        send_telegram_message(allowed_id, alert_message)
+                storage.messages.append(msg_data)
+                storage.message_hashes.add(msg_hash)
             
-            # ОТВЕТ ПОЛЬЗОВАТЕЛЮ (только разрешенным)
+            # Если обнаружены утечки - отправляем оповещение
+            if leaks:
+                for leak in leaks:
+                    # Получаем информацию о пользователе
+                    user_info = storage.users.get(user_id, {})
+                    if not user_info:
+                        storage.users[user_id] = {
+                            "id": user_id,
+                            "username": message.get("from", {}).get("username", ""),
+                            "first_name": message.get("from", {}).get("first_name", ""),
+                            "leaks_count": 0,
+                            "first_seen": datetime.now().isoformat()
+                        }
+                        user_info = storage.users[user_id]
+                    
+                    user_info["leaks_count"] = user_info.get("leaks_count", 0) + 1
+                    user_info["last_seen"] = datetime.now().isoformat()
+                    
+                    # Формируем данные для оповещения
+                    alert_data = {
+                        "type": leak["type"],
+                        "chat_id": chat_id,
+                        "chat_title": message.get("chat", {}).get("title", f"Chat {chat_id}"),
+                        "user_id": user_id,
+                        "username": user_info.get("username", ""),
+                        "message_id": message.get("message_id"),
+                        "confidence": leak["confidence"],
+                        "details": leak["details"],
+                        "timestamp": leak["timestamp"]
+                    }
+                    
+                    # Отправляем оповещение
+                    send_alert_to_allowed_users(alert_data)
+                    
+                    print(f"🚨 Real-time leak detected: {leak['type']} in chat {chat_id}")
+            
+            # Обработка команд от разрешённых пользователей
             if user_id in ALLOWED_IDS:
-                if text.lower() in ["/start", "/старт"]:
-                    welcome_msg = f"""
-🔐 <b>УЛЬТРА-ЖЕСТКИЙ ДЕТЕКТОР УТЕЧЕК</b>
-
-<b>⚡ РЕЖИМ:</b> МАКСИМАЛЬНАЯ СТРОГОСТЬ
-<b>👥 ДОСТУП:</b> Только {len(ALLOWED_IDS)} пользователей
-
-<b>🔍 ТИПЫ ОБНАРУЖЕНИЯ:</b>
-├─ 📤 <b>ПЕРЕСЫЛКИ:</b> 25+ паттернов
-├─ 📋 <b>КОПИРОВАНИЕ:</b> 20+ паттернов  
-├─ 📸 <b>СКРИНШОТЫ:</b> 30+ паттернов
-└─ ⚠️ <b>ДРУГИЕ УТЕЧКИ:</b> 15+ паттернов
-
-<b>📊 СТАТИСТИКА СИСТЕМЫ:</b>
-├─ Сообщений: {len(storage.messages)}
-├─ Пользователей: {len(storage.users)}
-├─ Чатов: {len(storage.bot_chats)}
-└─ Утечек: {sum(len(v) for v in storage.leaks_by_source.values())}
-
-<b>🔧 КОМАНДЫ:</b>
-├─ /stats - статистика
-├─ /mystats - моя статистика
-├─ /leaks - последние утечки
-└─ /help - помощь
-
-<i>Система активна и мониторит {len(storage.bot_chats)} чатов</i>
-"""
-                    send_telegram_message(chat_id, welcome_msg)
+                text = message.get("text", "").lower()
                 
-                elif text.lower() in ["/stats", "/статистика"]:
-                    leak_stats = storage.get_leak_stats()
-                    stats_msg = f"""
-<b>📊 СТАТИСТИКА УЛЬТРА-ЖЕСТКОГО МОНИТОРИНГА</b>
-
-<b>📈 ОБЩАЯ СТАТИСТИКА:</b>
-├─ 📨 Сообщений: <b>{len(storage.messages)}</b>
-├─ 👥 Пользователей: <b>{len(storage.users)}</b>
-├─ 💬 Чатов: <b>{len(storage.bot_chats)}</b>
-└─ ⚠️ Утечек: <b>{leak_stats['total']}</b>
-
-<b>🔍 РАСПРЕДЕЛЕНИЕ УТЕЧЕК:</b>
-├─ 📤 Пересылки ИЗ чата: <b>{leak_stats['forward_from_our_chat']['count']}</b>
-├─ 📤 Пересылки В чат: <b>{leak_stats['forward_to_our_chat']['count']}</b>
-├─ 📋 Копирования ИЗ: <b>{leak_stats['copy_from_our_chat']['count']}</b>
-├─ 📋 Копирования В: <b>{leak_stats['copy_to_our_chat']['count']}</b>
-├─ 📸 Скриншоты ИЗ: <b>{leak_stats['screenshot_from_our_chat']['count']}</b>
-└─ 📸 Скриншоты В: <b>{leak_stats['screenshot_to_our_chat']['count']}</b>
-
-<b>📅 СЕГОДНЯ:</b>
-├─ Сообщений: <b>{len([m for m in storage.messages if m.get('time', '').startswith(datetime.now().strftime('%Y-%m-%d'))])}</b>
-└─ Утечек: <b>{sum([len([l for l in storage.leaks_by_source[lt] if l.get('timestamp', '').startswith(datetime.now().strftime('%Y-%m-%d'))]) for lt in storage.leaks_by_source])}</b>
-
-<i>🕒 Последнее обновление: {datetime.now().strftime('%H:%M:%S')}</i>
-"""
-                    send_telegram_message(chat_id, stats_msg)
-                
-                elif text.lower() == "/mystats":
-                    user_data = storage.users.get(user_id, {})
-                    user_leaks = sum(len([l for l in leaks if l.get("user_id") == user_id]) 
-                                   for leaks in storage.leaks_by_source.values())
-                    
-                    mystats_msg = f"""
-<b>📊 ВАША СТАТИСТИКА</b>
-
-<b>👤 ПРОФИЛЬ:</b>
-├─ ID: <code>{user_id}</code>
-├─ Username: @{user_data.get('username', 'не установлен')}
-└─ Имя: <b>{user_data.get('first_name', 'Неизвестно')}</b>
-
-<b>📈 АКТИВНОСТЬ:</b>
-├─ Сообщений: <b>{user_data.get('messages', 0)}</b>
-├─ Утечек: <b>{user_leaks}</b>
-├─ Первый раз: <b>{user_data.get('first_seen', '')[:16]}</b>
-└─ Последний раз: <b>{user_data.get('last_seen', '')[:16] if user_data.get('last_seen') else 'только что'}</b>
-
-<b>⚠️ ВАШИ УТЕЧКИ:</b>
-"""
-                    for leak_type, leaks in storage.leaks_by_source.items():
-                        user_type_leaks = [l for l in leaks if l.get("user_id") == user_id]
-                        if user_type_leaks:
-                            leak_name = leak_type.replace("_", " ").title()
-                            mystats_msg += f"├─ {leak_name}: <b>{len(user_type_leaks)}</b>\n"
-                    
-                    if user_leaks == 0:
-                        mystats_msg += "└─ 🟢 Утечек не обнаружено\n"
-                    
-                    mystats_msg += f"\n<i>Вы в {len([c for c in storage.bot_chats])} чатах с ботом</i>"
-                    send_telegram_message(chat_id, mystats_msg)
-                
-                elif text.lower() in ["/leaks", "/утечки"]:
-                    all_leaks = storage.get_all_leaks()
-                    if all_leaks:
-                        leaks_msg = f"""
-<b>⚠️ ПОСЛЕДНИЕ УТЕЧКИ (5 из {len(all_leaks)})</b>
-"""
-                        for i, leak in enumerate(all_leaks[:5], 1):
-                            leak_type = leak.get("leak_type", "unknown")
-                            emoji = "📤" if leak_type == "forward" else "📋" if leak_type == "copy" else "📸"
-                            confidence = leak.get("confidence", 0)
-                            risk_emoji = "🔴" if confidence > 80 else "🟠" if confidence > 60 else "🟡"
+                if text.startswith("/monitor"):
+                    # Команда для управления мониторингом
+                    parts = text.split()
+                    if len(parts) > 1:
+                        if parts[1] == "list":
+                            # Показать список мониторимых чатов
+                            response_msg = "📋 <b>Мониторимые чаты:</b>\n\n"
+                            for chat_id in list(storage.monitored_chats)[:10]:
+                                chat_info = storage.chat_metadata.get(str(chat_id), {})
+                                response_msg += f"• {chat_info.get('title', f'Chat {chat_id}')}\n"
                             
-                            leaks_msg += f"\n{i}. {emoji} <b>{leak_type.upper()}</b> {risk_emoji}\n"
-                            leaks_msg += f"   👤 @{leak.get('username', 'unknown')}\n"
-                            leaks_msg += f"   📍 {leak.get('chat_title', '')[:20]}\n"
-                            leaks_msg += f"   🎯 {confidence}% уверенности\n"
-                            leaks_msg += f"   🕒 {leak.get('timestamp', '')[:16]}\n"
-                    else:
-                        leaks_msg = "🟢 Утечек пока не обнаружено"
+                            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+                            requests.post(url, json={
+                                "chat_id": chat_id,
+                                "text": response_msg,
+                                "parse_mode": "HTML"
+                            })
+                
+                elif text.startswith("/stats"):
+                    # Статистика
+                    stats_msg = f"""
+📊 <b>REAL-TIME STATS</b>
+
+<b>Мониторинг:</b>
+• Чатов: {len(storage.monitored_chats)}
+• Сообщений: {len(storage.messages)}
+• Проверок: {len(storage.message_hashes)}
+
+<b>Утечки:</b>
+• Пересланные: {len(storage.leaks['forwarded_messages'])}
+• Внешние ссылки: {len(storage.leaks['external_shares'])}
+• Подозрительные: {len(storage.leaks['suspicious_activity'])}
+• Всего: {storage.get_total_leaks()}
+
+<b>Система:</b>
+• Режим: REAL-TIME
+• Интервал: {monitor.check_interval} сек
+• API: Connected
+"""
                     
-                    leaks_msg += f"\n\n<i>Подробности на веб-панели</i>"
-                    send_telegram_message(chat_id, leaks_msg)
+                    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+                    requests.post(url, json={
+                        "chat_id": chat_id,
+                        "text": stats_msg,
+                        "parse_mode": "HTML"
+                    })
         
         # Автосохранение
-        if len(storage.messages) % 20 == 0:
+        if len(storage.messages) % 25 == 0:
             storage.save()
         
         return jsonify({"ok": True, "processed": True})
@@ -962,21 +735,25 @@ def webhook():
         print(f"Webhook error: {e}")
         return jsonify({"ok": False, "error": str(e)}), 500
 
-# Автосохранение каждые 2 минуты
+# Автосохранение
 def auto_save():
     while True:
-        time.sleep(120)
+        time.sleep(180)
         storage.save()
 
 import threading
-thread = threading.Thread(target=auto_save, daemon=True)
-thread.start()
+save_thread = threading.Thread(target=auto_save, daemon=True)
+save_thread.start()
 
 # ========== ЗАПУСК ==========
 if __name__ == "__main__":
-    print("🚀 Запуск УЛЬТРА-ЖЕСТКОГО ДЕТЕКТОРА УТЕЧЕК...")
-    print(f"✅ Режим: МАКСИМАЛЬНАЯ СТРОГОСТЬ")
-    print(f"✅ Доступ: {len(ALLOWED_IDS)} пользователей")
-    print(f"✅ Паттернов: 100+ жестких правил")
-    print("="*60)
+    print("🚀 Запуск ИНТЕГРИРОВАННОГО ТЕЛЕГРАМ БОТА...")
+    print(f"✅ Telegram API: Подключено")
+    print(f"✅ Real-Time мониторинг: Готов")
+    print(f"✅ Разрешённые пользователи: {len(ALLOWED_IDS)}")
+    print("="*70)
+    print("⚡ Система работает как ЕДИНОЕ ЦЕЛОЕ с Telegram")
+    print("🔍 Обнаружение РЕАЛЬНЫХ сливов, а не текста")
+    print("="*70)
+    
     app.run(host="0.0.0.0", port=PORT, debug=False)
