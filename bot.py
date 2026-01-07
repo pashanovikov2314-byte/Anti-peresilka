@@ -6,7 +6,7 @@ import requests
 from datetime import datetime
 from flask import Flask
 from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext
 from collections import defaultdict
 import json
 import os
@@ -55,27 +55,28 @@ class TelegramLeakBot:
         self.skillup_ultra_mode = False
         self.ultra_detection_level = 5
         
-        # Создаем Application для версии 20.x
-        self.application = Application.builder().token(TOKEN).build()
+        # Используем Updater для версии 13.x
+        self.updater = Updater(TOKEN, use_context=True)
+        self.dispatcher = self.updater.dispatcher
         
         self.register_handlers()
         self.load_data()
         self.start_background_tasks()
         self.setup_flask_endpoints()
         
-        logger.info("🤖 Бот инициализирован (версия 20.x)")
+        logger.info("🤖 Бот инициализирован (версия 13.x)")
 
     def register_handlers(self):
-        self.application.add_handler(CommandHandler("start", self.start_command))
-        self.application.add_handler(CommandHandler("help", self.help_command))
-        self.application.add_handler(CommandHandler("leakstats", self.leakstats_command))
-        self.application.add_handler(CommandHandler("leakinfo", self.leakinfo_command))
-        self.application.add_handler(CommandHandler("pingstatus", self.pingstatus_command))
-        self.application.add_handler(CommandHandler("toggleping", self.toggleping_command))
-        self.application.add_handler(CommandHandler("status", self.status_command))
-        self.application.add_handler(CommandHandler("clear", self.clear_command))
-        self.application.add_handler(CommandHandler("skillup", self.skillup_command))
-        self.application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, self.monitor_messages))
+        self.dispatcher.add_handler(CommandHandler("start", self.start_command))
+        self.dispatcher.add_handler(CommandHandler("help", self.help_command))
+        self.dispatcher.add_handler(CommandHandler("leakstats", self.leakstats_command))
+        self.dispatcher.add_handler(CommandHandler("leakinfo", self.leakinfo_command))
+        self.dispatcher.add_handler(CommandHandler("pingstatus", self.pingstatus_command))
+        self.dispatcher.add_handler(CommandHandler("toggleping", self.toggleping_command))
+        self.dispatcher.add_handler(CommandHandler("status", self.status_command))
+        self.dispatcher.add_handler(CommandHandler("clear", self.clear_command))
+        self.dispatcher.add_handler(CommandHandler("skillup", self.skillup_command))
+        self.dispatcher.add_handler(MessageHandler(Filters.all & ~Filters.command, self.monitor_messages))
 
     def setup_flask_endpoints(self):
         @app.route('/')
@@ -135,11 +136,11 @@ class TelegramLeakBot:
         except Exception as e:
             logger.warning(f"⚠️ Ошибка самопинга: {str(e)[:100]}")
 
-    async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    def start_command(self, update: Update, context: CallbackContext):
         user_id = update.effective_user.id
         
         if user_id not in ALLOWED_USER_IDS:
-            await update.message.reply_text("❌ Бот временно не работает.")
+            update.message.reply_text("❌ Бот временно не работает.")
             return
         
         welcome = """
@@ -158,9 +159,9 @@ class TelegramLeakBot:
 🤖 Бот работает в фоновом режиме.
 Все обнаруженные утечки будут отправлены вам в ЛС.
         """
-        await update.message.reply_text(welcome, parse_mode='Markdown')
+        update.message.reply_text(welcome, parse_mode='Markdown')
 
-    async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    def help_command(self, update: Update, context: CallbackContext):
         user_id = update.effective_user.id
         if user_id not in ALLOWED_USER_IDS:
             return
@@ -192,9 +193,9 @@ class TelegramLeakBot:
 
 🤫 **Примечание:** Бот не отвечает в чатах, только в ЛС.
         """
-        await update.message.reply_text(help_text, parse_mode='Markdown')
+        update.message.reply_text(help_text, parse_mode='Markdown')
 
-    async def monitor_messages(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    def monitor_messages(self, update: Update, context: CallbackContext):
         msg = update.message
         if not msg or msg.chat.type == 'private':
             return
@@ -217,7 +218,7 @@ class TelegramLeakBot:
         leak_info = self.detect_leak_ultra(msg) if self.skillup_ultra_mode else self.detect_leak(msg)
         
         if leak_info:
-            await self.handle_leak(user_id, leak_info, msg, context)
+            self.handle_leak(user_id, leak_info, msg, context)
 
     def detect_leak(self, msg):
         leak_type = None
@@ -359,16 +360,16 @@ class TelegramLeakBot:
         
         return min(score * self.ultra_detection_level, 100)
 
-    async def handle_leak(self, user_id, leak_info, msg, context):
+    def handle_leak(self, user_id, leak_info, msg, context):
         self.leaks_by_user[user_id].append(leak_info)
         
         if len(self.leaks_by_user[user_id]) > 50:
             self.leaks_by_user[user_id] = self.leaks_by_user[user_id][-50:]
         
-        await self.send_leak_alert(user_id, leak_info, msg, context)
+        self.send_leak_alert(user_id, leak_info, msg, context)
         self.save_data()
 
-    async def send_leak_alert(self, user_id, leak_info, msg, context):
+    def send_leak_alert(self, user_id, leak_info, msg, context):
         for admin_id in ALLOWED_USER_IDS:
             try:
                 user = self.user_info.get(user_id, {'username': f'id{user_id}', 'first_name': ''})
@@ -397,7 +398,7 @@ class TelegramLeakBot:
                 
                 alert += f"📈 Всего утечек от этого пользователя: {len(self.leaks_by_user[user_id])}"
                 
-                await context.bot.send_message(
+                context.bot.send_message(
                     chat_id=admin_id,
                     text=alert,
                     parse_mode='Markdown',
@@ -408,7 +409,7 @@ class TelegramLeakBot:
             except Exception as e:
                 logger.error(f"❌ Ошибка отправки админу {admin_id}: {e}")
 
-    async def leakstats_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    def leakstats_command(self, update: Update, context: CallbackContext):
         user_id = update.effective_user.id
         if user_id not in ALLOWED_USER_IDS:
             return
@@ -434,28 +435,28 @@ class TelegramLeakBot:
                 user = self.user_info.get(uid, {'username': f'id{uid}'})
                 stats += f"{i}. @{user['username']} - {len(leaks)} утечек\n"
         
-        await update.message.reply_text(stats, parse_mode='Markdown')
+        update.message.reply_text(stats, parse_mode='Markdown')
 
-    async def leakinfo_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    def leakinfo_command(self, update: Update, context: CallbackContext):
         user_id = update.effective_user.id
         if user_id not in ALLOWED_USER_IDS:
             return
         
         if not context.args:
-            await update.message.reply_text("❌ Укажите ID пользователя: /leakinfo [ID]")
+            update.message.reply_text("❌ Укажите ID пользователя: /leakinfo [ID]")
             return
         
         try:
             target_id = int(context.args[0])
         except:
-            await update.message.reply_text("❌ Неверный ID")
+            update.message.reply_text("❌ Неверный ID")
             return
         
         leaks = self.leaks_by_user.get(target_id, [])
         user = self.user_info.get(target_id, {'username': f'id{target_id}'})
         
         if not leaks:
-            await update.message.reply_text(f"ℹ️ У пользователя @{user['username']} нет утечек")
+            update.message.reply_text(f"ℹ️ У пользователя @{user['username']} нет утечек")
             return
         
         response = f"📄 **Утечки пользователя @{user['username']}**\n\n"
@@ -468,9 +469,9 @@ class TelegramLeakBot:
         
         response += f"📈 Всего утечек: {len(leaks)}"
         
-        await update.message.reply_text(response, parse_mode='Markdown')
+        update.message.reply_text(response, parse_mode='Markdown')
 
-    async def pingstatus_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    def pingstatus_command(self, update: Update, context: CallbackContext):
         user_id = update.effective_user.id
         if user_id not in ALLOWED_USER_IDS:
             return
@@ -486,18 +487,18 @@ class TelegramLeakBot:
         if RENDER_URL:
             response += f"• URL: {RENDER_URL[:30]}..."
         
-        await update.message.reply_text(response, parse_mode='Markdown')
+        update.message.reply_text(response, parse_mode='Markdown')
 
-    async def toggleping_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    def toggleping_command(self, update: Update, context: CallbackContext):
         user_id = update.effective_user.id
         if user_id not in ALLOWED_USER_IDS:
             return
         
         self.self_ping_enabled = not self.self_ping_enabled
         status = "включен" if self.self_ping_enabled else "выключен"
-        await update.message.reply_text(f"🔄 Самопинг {status}!")
+        update.message.reply_text(f"🔄 Самопинг {status}!")
 
-    async def status_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    def status_command(self, update: Update, context: CallbackContext):
         user_id = update.effective_user.id
         if user_id not in ALLOWED_USER_IDS:
             return
@@ -515,9 +516,9 @@ class TelegramLeakBot:
         response += f"• Самопинг: {'🟢 ВКЛ' if self.self_ping_enabled else '🔴 ВЫКЛ'}\n"
         response += f"• Web сервер: {'🟢 ONLINE' if RENDER_URL else '🔴 OFFLINE'}"
         
-        await update.message.reply_text(response, parse_mode='Markdown')
+        update.message.reply_text(response, parse_mode='Markdown')
 
-    async def clear_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    def clear_command(self, update: Update, context: CallbackContext):
         user_id = update.effective_user.id
         if user_id not in ALLOWED_USER_IDS:
             return
@@ -526,16 +527,16 @@ class TelegramLeakBot:
         self.leaks_by_user.clear()
         self.user_info.clear()
         
-        await update.message.reply_text(f"🧹 Очищено {count} утечек и данных о пользователях")
+        update.message.reply_text(f"🧹 Очищено {count} утечек и данных о пользователях")
 
-    async def skillup_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    def skillup_command(self, update: Update, context: CallbackContext):
         user_id = update.effective_user.id
         if user_id not in ALLOWED_USER_IDS:
             return
         
         self.skillup_ultra_mode = not self.skillup_ultra_mode
         status = "🔥 ULTRA MODE" if self.skillup_ultra_mode else "NORMAL"
-        await update.message.reply_text(f"⚡ Режим изменен на: {status}")
+        update.message.reply_text(f"⚡ Режим изменен на: {status}")
 
     def save_data(self):
         try:
@@ -581,11 +582,9 @@ class TelegramLeakBot:
         )
         flask_thread.start()
         
-        # Запуск бота с Application (ВЕРСИЯ 20.x)
-        self.application.run_polling(
-            allowed_updates=Update.ALL_TYPES,
-            drop_pending_updates=True
-        )
+        # Запуск бота для версии 13.x
+        self.updater.start_polling()
+        self.updater.idle()
 
 def main():
     bot = TelegramLeakBot()
