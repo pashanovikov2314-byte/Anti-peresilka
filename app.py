@@ -850,3 +850,21 @@ def dashboard_data():
 if __name__ == "__main__":
     logger.info("=" * 70)
     logger.info("🚀 ЗАПУСК ADVANCED TELEGRAM MONITOR")
+    logger.info("=" * 70)
+    logger.info(f"🤖 Token: {'✓' if TELEGRAM_TOKEN else '✗'}")
+    logger.info(f"👮 Allowed IDs: {len(ALLOWED_IDS)} users")
+    logger.info(f"🌐 Port: {PORT}")
+    logger.info("=" * 70)
+    
+    # Проверяем бота
+    try:
+        response = requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getMe", timeout=10)
+        if response.json().get("ok"):
+            bot = response.json()["result"]
+            logger.info(f"✅ Бот: @{bot.get('username')} (ID: {bot.get('id')})")
+        else:
+            logger.error(f"❌ Ошибка бота: {response.json().get('description')}")
+    except Exception as e:
+        logger.error(f"❌ Не удалось подключиться к боту: {e}")
+    
+    app.run(host="0.0.0.0", port=PORT, debug=False)
