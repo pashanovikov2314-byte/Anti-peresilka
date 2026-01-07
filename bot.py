@@ -1,3 +1,75 @@
+# ========== ЗАГЛУШКА ДЛЯ imghdr (удалён в Python 3.11+) ==========
+import sys
+
+class ImghdrStub:
+    """Заглушка для модуля imghdr, который был удалён в Python 3.11+"""
+    
+    @staticmethod
+    def what(file, h=None):
+        """Определение типа изображения (заглушка)"""
+        return None
+    
+    @staticmethod
+    def test_jpeg(h):
+        return None
+    
+    @staticmethod 
+    def test_png(h):
+        return None
+    
+    @staticmethod
+    def test_gif(h):
+        return None
+    
+    @staticmethod
+    def test_tiff(h):
+        return None
+    
+    @staticmethod
+    def test_rgb(h):
+        return None
+    
+    @staticmethod
+    def test_pbm(h):
+        return None
+    
+    @staticmethod
+    def test_pgm(h):
+        return None
+    
+    @staticmethod
+    def test_ppm(h):
+        return None
+    
+    @staticmethod
+    def test_rast(h):
+        return None
+    
+    @staticmethod
+    def test_xbm(h):
+        return None
+    
+    @staticmethod
+    def test_bmp(h):
+        return None
+    
+    @staticmethod
+    def test_exr(h):
+        return None
+    
+    @staticmethod
+    def test_webp(h):
+        return None
+
+# Создаём фиктивный модуль
+imghdr_module = type(sys)('imghdr')
+imghdr_module.__dict__.update({k: v for k, v in ImghdrStub.__dict__.items() 
+                              if not k.startswith('__')})
+
+# Добавляем в sys.modules для импорта
+sys.modules['imghdr'] = imghdr_module
+
+# ========== ИМПОРТЫ ==========
 import logging
 import re
 import time
