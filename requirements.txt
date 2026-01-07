@@ -3,5 +3,5 @@ requests==2.31.0
 python-telegram-bot==13.15
 python-dotenv==1.0.0
 pytz==2023.3
-tzlocal==5.2
 loguru==0.7.2
+cachetools==5.3.2
