@@ -1,0 +1,566 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>🛡️ Advanced Security Bot Dashboard</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        :root {
+            --primary: #4361ee;
+            --secondary: #3a0ca3;
+            --danger: #f72585;
+            --warning: #f8961e;
+            --success: #4cc9f0;
+            --dark: #1a1a2e;
+            --light: #f8f9fa;
+            --gray: #6c757d;
+        }
+        
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Inter', sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: var(--dark);
+            min-height: 100vh;
+            padding: 20px;
+        }
+        
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+        }
+        
+        /* Header */
+        .header {
+            background: rgba(255, 255, 255, 0.95);
+            backdrop-filter: blur(10px);
+            padding: 40px;
+            border-radius: 20px;
+            margin-bottom: 30px;
+            box-shadow: 0 10px 40px rgba(0,0,0,0.1);
+            border: 1px solid rgba(255,255,255,0.2);
+        }
+        
+        .header-top {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+        }
+        
+        .header h1 {
+            color: var(--primary);
+            font-size: 2.5em;
+            font-weight: 700;
+            margin-bottom: 10px;
+        }
+        
+        .header p {
+            color: var(--gray);
+            font-size: 1.1em;
+            margin-bottom: 20px;
+        }
+        
+        /* Stats Grid */
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+            gap: 20px;
+            margin: 30px 0;
+        }
+        
+        .stat-card {
+            background: white;
+            padding: 25px;
+            border-radius: 15px;
+            box-shadow: 0 5px 20px rgba(0,0,0,0.08);
+            transition: all 0.3s ease;
+            position: relative;
+            overflow: hidden;
+        }
+        
+        .stat-card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 15px 30px rgba(0,0,0,0.15);
+        }
+        
+        .stat-card::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 5px;
+            height: 100%;
+            background: var(--primary);
+        }
+        
+        .stat-card.danger::before { background: var(--danger); }
+        .stat-card.warning::before { background: var(--warning); }
+        .stat-card.success::before { background: var(--success); }
+        
+        .stat-icon {
+            font-size: 2em;
+            margin-bottom: 15px;
+        }
+        
+        .stat-value {
+            font-size: 2.5em;
+            font-weight: 700;
+            margin: 10px 0;
+        }
+        
+        .stat-label {
+            color: var(--gray);
+            font-size: 0.9em;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+        
+        /* Sections */
+        .section {
+            background: rgba(255, 255, 255, 0.95);
+            padding: 30px;
+            border-radius: 20px;
+            margin-bottom: 30px;
+            box-shadow: 0 5px 20px rgba(0,0,0,0.08);
+        }
+        
+        .section-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 25px;
+            padding-bottom: 15px;
+            border-bottom: 2px solid #f0f0f0;
+        }
+        
+        .section-title {
+            color: var(--primary);
+            font-size: 1.5em;
+            font-weight: 600;
+        }
+        
+        /* Tables */
+        .table-container {
+            overflow-x: auto;
+            border-radius: 10px;
+            background: white;
+        }
+        
+        table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+        
+        th {
+            background: #f8f9fa;
+            padding: 18px 20px;
+            text-align: left;
+            font-weight: 600;
+            color: var(--dark);
+            border-bottom: 2px solid #e9ecef;
+        }
+        
+        td {
+            padding: 16px 20px;
+            border-bottom: 1px solid #f0f0f0;
+            vertical-align: middle;
+        }
+        
+        tr:hover {
+            background: #f8f9ff;
+        }
+        
+        /* Badges */
+        .badge {
+            display: inline-block;
+            padding: 6px 12px;
+            border-radius: 20px;
+            font-size: 0.85em;
+            font-weight: 600;
+        }
+        
+        .badge-danger {
+            background: #ffe6e6;
+            color: #d63031;
+        }
+        
+        .badge-warning {
+            background: #fff4e6;
+            color: #e17055;
+        }
+        
+        .badge-success {
+            background: #d4edda;
+            color: #155724;
+        }
+        
+        .badge-info {
+            background: #e3f2fd;
+            color: #1976d2;
+        }
+        
+        /* Charts */
+        .chart-container {
+            background: white;
+            padding: 20px;
+            border-radius: 15px;
+            margin: 20px 0;
+        }
+        
+        /* Bot Chats */
+        .chats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+            gap: 20px;
+            margin-top: 20px;
+        }
+        
+        .chat-card {
+            background: white;
+            padding: 20px;
+            border-radius: 15px;
+            border-left: 5px solid var(--primary);
+            box-shadow: 0 3px 15px rgba(0,0,0,0.05);
+        }
+        
+        .chat-card:hover {
+            box-shadow: 0 5px 20px rgba(0,0,0,0.1);
+        }
+        
+        .chat-title {
+            font-weight: 600;
+            font-size: 1.1em;
+            margin-bottom: 10px;
+            color: var(--dark);
+        }
+        
+        /* Buttons */
+        .btn {
+            display: inline-block;
+            padding: 12px 24px;
+            background: var(--primary);
+            color: white;
+            text-decoration: none;
+            border-radius: 10px;
+            font-weight: 600;
+            transition: all 0.3s;
+            border: none;
+            cursor: pointer;
+        }
+        
+        .btn:hover {
+            background: var(--secondary);
+            transform: translateY(-2px);
+        }
+        
+        .btn-danger {
+            background: var(--danger);
+        }
+        
+        .btn-success {
+            background: var(--success);
+        }
+        
+        /* Status */
+        .status-badge {
+            display: inline-flex;
+            align-items: center;
+            padding: 8px 16px;
+            background: #d4edda;
+            color: #155724;
+            border-radius: 20px;
+            font-weight: 600;
+        }
+        
+        .status-badge::before {
+            content: '';
+            width: 10px;
+            height: 10px;
+            background: #28a745;
+            border-radius: 50%;
+            margin-right: 8px;
+        }
+        
+        /* Footer */
+        .footer {
+            text-align: center;
+            margin-top: 40px;
+            color: white;
+            opacity: 0.8;
+        }
+        
+        /* Responsive */
+        @media (max-width: 768px) {
+            .header {
+                padding: 25px;
+            }
+            
+            .header h1 {
+                font-size: 2em;
+            }
+            
+            .stats-grid {
+                grid-template-columns: repeat(2, 1fr);
+            }
+            
+            .section {
+                padding: 20px;
+            }
+        }
+        
+        @media (max-width: 480px) {
+            .stats-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <!-- Header -->
+        <div class="header">
+            <div class="header-top">
+                <div>
+                    <h1>🛡️ Advanced Security Bot</h1>
+                    <p>Система многоуровневого мониторинга утечек информации</p>
+                </div>
+                <div class="status-badge">🟢 СИСТЕМА АКТИВНА</div>
+            </div>
+            
+            <div style="display: flex; gap: 15px; flex-wrap: wrap;">
+                <a href="/setup" class="btn">🔄 Обновить Webhook</a>
+                <a href="/api/export" class="btn btn-success" target="_blank">📥 Экспорт данных</a>
+                <a href="/health" class="btn btn-info" target="_blank">❤️ Проверка работы</a>
+            </div>
+            
+            <div style="margin-top: 20px; background: #f8f9fa; padding: 15px; border-radius: 10px;">
+                <p><strong>👥 Разрешённые пользователи:</strong> 
+                    {% for uid in allowed_ids %}
+                    <span class="badge badge-info">{{ uid }}</span>
+                    {% endfor %}
+                </p>
+                <p><strong>🤖 Чатов с ботом:</strong> {{ stats.bot_chats_count }}</p>
+            </div>
+        </div>
+        
+        <!-- Main Stats -->
+        <div class="stats-grid">
+            <div class="stat-card">
+                <div class="stat-icon">📨</div>
+                <div class="stat-value">{{ stats.total_messages }}</div>
+                <div class="stat-label">Всего сообщений</div>
+            </div>
+            
+            <div class="stat-card success">
+                <div class="stat-icon">👥</div>
+                <div class="stat-value">{{ stats.total_users }}</div>
+                <div class="stat-label">Пользователей</div>
+            </div>
+            
+            <div class="stat-card warning">
+                <div class="stat-icon">💬</div>
+                <div class="stat-value">{{ stats.total_chats }}</div>
+                <div class="stat-label">Чатов в базе</div>
+            </div>
+            
+            <div class="stat-card danger">
+                <div class="stat-icon">⚠️</div>
+                <div class="stat-value">{{ stats.total_leaks }}</div>
+                <div class="stat-label">Обнаружено утечек</div>
+            </div>
+        </div>
+        
+        <!-- Recent Leaks -->
+        <div class="section">
+            <div class="section-header">
+                <h2 class="section-title">⚠️ Последние утечки</h2>
+                <a href="/api/leaks" class="btn btn-danger" target="_blank">Все утечки</a>
+            </div>
+            
+            {% if recent_leaks %}
+            <div class="table-container">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Время</th>
+                            <th>Чат</th>
+                            <th>Пользователь</th>
+                            <th>Риск</th>
+                            <th>Типы</th>
+                            <th>Сообщение</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for leak in recent_leaks %}
+                        <tr>
+                            <td>{{ leak.timestamp[:16] }}</td>
+                            <td><strong>{{ leak.chat_title[:20] }}{{ '...' if leak.chat_title|length > 20 else '' }}</strong></td>
+                            <td>@{{ leak.username or 'без username' }}</td>
+                            <td>
+                                {% if leak.risk_score > 70 %}
+                                <span class="badge badge-danger">{{ leak.risk_score }}%</span>
+                                {% elif leak.risk_score > 40 %}
+                                <span class="badge badge-warning">{{ leak.risk_score }}%</span>
+                                {% else %}
+                                <span class="badge badge-info">{{ leak.risk_score }}%</span>
+                                {% endif %}
+                            </td>
+                            <td>{{ leak.leak_types[0] if leak.leak_types else '—' }}</td>
+                            <td>{{ leak.text[:50] }}{{ '...' if leak.text|length > 50 else '' }}</td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+            {% else %}
+            <p style="text-align: center; padding: 40px; color: var(--gray);">🟢 Утечек пока не обнаружено</p>
+            {% endif %}
+        </div>
+        
+        <!-- Bot Chats -->
+        <div class="section">
+            <div class="section-header">
+                <h2 class="section-title">🤖 Чаты с ботом</h2>
+                <a href="/api/bot_chats" class="btn" target="_blank">Все чаты</a>
+            </div>
+            
+            {% if bot_chats %}
+            <div class="chats-grid">
+                {% for chat in bot_chats[:12] %}
+                <div class="chat-card">
+                    <div class="chat-title">{{ chat.title }}</div>
+                    <div style="color: var(--gray); font-size: 0.9em; margin-bottom: 10px;">
+                        ID: <code>{{ chat.id }}</code>
+                    </div>
+                    <div style="display: flex; justify-content: space-between; margin-top: 10px;">
+                        <span>📨 Сообщений: {{ chat.messages_count or 0 }}</span>
+                        <span>📍 {{ chat.type or 'unknown' }}</span>
+                    </div>
+                </div>
+                {% endfor %}
+            </div>
+            {% else %}
+            <p style="text-align: center; padding: 40px; color: var(--gray);">🤖 Бот пока не добавлен ни в один чат</p>
+            {% endif %}
+        </div>
+        
+        <!-- Recent Messages -->
+        <div class="section">
+            <div class="section-header">
+                <h2 class="section-title">📨 Последние сообщения</h2>
+                <a href="/api/stats" class="btn" target="_blank">Вся статистика</a>
+            </div>
+            
+            {% if recent_messages %}
+            <div class="table-container">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Время</th>
+                            <th>Чат</th>
+                            <th>Пользователь</th>
+                            <th>Сообщение</th>
+                            <th>Статус</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for msg in recent_messages %}
+                        <tr>
+                            <td>{{ msg.time[11:19] }}</td>
+                            <td>{{ msg.chat_title[:15] }}{{ '...' if msg.chat_title|length > 15 else '' }}</td>
+                            <td>@{{ msg.username or msg.first_name or 'unknown' }}</td>
+                            <td>{{ msg.text[:60] }}{{ '...' if msg.text|length > 60 else '' }}</td>
+                            <td>
+                                {% if msg.is_forward %}
+                                <span class="badge badge-warning">Пересылка</span>
+                                {% elif msg.has_media %}
+                                <span class="badge badge-info">Медиа</span>
+                                {% else %}
+                                <span class="badge badge-success">Текст</span>
+                                {% endif %}
+                            </td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+            {% else %}
+            <p style="text-align: center; padding: 40px; color: var(--gray);">📭 Сообщений пока нет</p>
+            {% endif %}
+        </div>
+        
+        <!-- API Documentation -->
+        <div class="section">
+            <div class="section-header">
+                <h2 class="section-title">🔧 API Endpoints</h2>
+            </div>
+            
+            <div style="display: grid; gap: 15px;">
+                <div style="background: #f8f9fa; padding: 15px; border-radius: 10px; border-left: 4px solid var(--primary);">
+                    <div style="font-weight: 600; margin-bottom: 5px;">📊 Статистика</div>
+                    <div style="display: flex; justify-content: space-between; align-items: center;">
+                        <code>GET /api/stats</code>
+                        <a href="/api/stats" target="_blank" style="color: var(--primary); text-decoration: none;">🔗 Открыть</a>
+                    </div>
+                </div>
+                
+                <div style="background: #f8f9fa; padding: 15px; border-radius: 10px; border-left: 4px solid var(--danger);">
+                    <div style="font-weight: 600; margin-bottom: 5px;">⚠️ Утечки</div>
+                    <div style="display: flex; justify-content: space-between; align-items: center;">
+                        <code>GET /api/leaks</code>
+                        <a href="/api/leaks" target="_blank" style="color: var(--danger); text-decoration: none;">🔗 Открыть</a>
+                    </div>
+                </div>
+                
+                <div style="background: #f8f9fa; padding: 15px; border-radius: 10px; border-left: 4px solid var(--success);">
+                    <div style="font-weight: 600; margin-bottom: 5px;">👥 Пользователи</div>
+                    <div style="display: flex; justify-content: space-between; align-items: center;">
+                        <code>GET /api/users</code>
+                        <a href="/api/users" target="_blank" style="color: var(--success); text-decoration: none;">🔗 Открыть</a>
+                    </div>
+                </div>
+                
+                <div style="background: #f8f9fa; padding: 15px; border-radius: 10px; border-left: 4px solid var(--warning);">
+                    <div style="font-weight: 600; margin-bottom: 5px;">🤖 Чаты с ботом</div>
+                    <div style="display: flex; justify-content: space-between; align-items: center;">
+                        <code>GET /api/bot_chats</code>
+                        <a href="/api/bot_chats" target="_blank" style="color: var(--warning); text-decoration: none;">🔗 Открыть</a>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Footer -->
+        <div class="footer">
+            <p>Advanced Security Bot • Многоуровневая система мониторинга утечек</p>
+            <p>Последнее обновление: {{ stats.last_update }}</p>
+        </div>
+    </div>
+    
+    <script>
+        // Автоматическое обновление страницы каждые 30 секунд
+        setTimeout(() => {
+            location.reload();
+        }, 30000);
+        
+        // Подсветка активных чатов
+        document.addEventListener('DOMContentLoaded', function() {
+            const chatCards = document.querySelectorAll('.chat-card');
+            chatCards.forEach(card => {
+                card.addEventListener('click', function() {
+                    const chatId = this.querySelector('code').textContent;
+                    alert('ID чата: ' + chatId);
+                });
+            });
+        });
+    </script>
+</body>
+</html>
